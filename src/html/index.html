@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESP32 Relay Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --text:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; --danger:#f87171; }
+    *{box-sizing:border-box}
+    body{
+      margin:0; background:linear-gradient(180deg,#0b1220,#0f172a 30%);
+      min-height:100vh; display:flex; align-items:center; justify-content:center; color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    .card{
+      width:min(680px,92vw); background:var(--card); border-radius:18px; padding:22px;
+      box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
+      border:1px solid rgba(255,255,255,.06);
+    }
+    h1{margin:0 0 6px;font-size:22px;letter-spacing:.2px}
+    p{margin:.25rem 0 1.25rem;color:var(--muted);font-size:14px}
+    .grid{
+      display:grid; grid-template-columns: repeat(1, 1fr); gap:12px;
+    }
+    .cell{
+      background:rgba(255,255,255,.02); padding:14px; border-radius:14px; border:1px solid rgba(255,255,255,.05)
+    }
+    .name{font-size:14px;margin:0 0 8px;color:#cbd5e1}
+    .row{display:flex; gap:10px}
+    button{
+      flex:1; padding:10px 12px; border:none; border-radius:12px; color:white; font-weight:600; letter-spacing:.2px;
+      background:var(--accent); cursor:pointer; transition: transform .05s ease, filter .2s ease, background .2s ease;
+      box-shadow: 0 4px 18px rgba(96,165,250,.25);
+    }
+    button:active{ transform:scale(.97) }
+    .off{ background:var(--danger); box-shadow: 0 4px 18px rgba(248,113,113,.25); }
+    .footer{margin-top:14px; font-size:12px; color:var(--muted); text-align:right}
+  </style>
+  <script>
+    async function send(path) {
+      try {
+        const r = await fetch(path, { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+      } catch (e) {
+        alert("Request failed: " + e.message);
+      }
+      updateUI(); // refresh state after command
+    }
+
+    async function updateUI() {
+      try {
+        const r = await fetch("/status", { cache: "no-store" });
+        const st = await r.json();
+        for (let i=1; i<=3; i++) {
+          const onBtn = document.getElementById("r"+i+"on");
+          const offBtn = document.getElementById("r"+i+"off");
+          if (st["relay"+i]) {
+            onBtn.style.opacity = "1";
+            offBtn.style.opacity = "0.4";
+          } else {
+            onBtn.style.opacity = "0.4";
+            offBtn.style.opacity = "1";
+          }
+        }
+      } catch (e) { console.error("Status error", e); }
+    }
+    window.onload = () => { updateUI(); setInterval(updateUI, 3000); }
+  </script>
+  
+</head>
+<body>
+  <div class="card">
+    <h1>ESP32 Relay Control</h1>
+    <p>Tap a button to toggle a relay. The page is tiny & embedded in firmware.</p>
+    <div class="grid">
+      <div class="cell">
+        <div class="name">Pasillo</div>
+        <div class="row">
+          <button id="r1on" onclick="send('/relay1?on')">ON</button>
+          <button id="r1off" class="off" onclick="send('/relay1?off')">OFF</button>
+        </div>
+      </div>
+      <div class="cell">
+        <div class="name">Cocina</div>
+        <div class="row">
+          <button id="r2on" onclick="send('/relay2?on')">ON</button>
+          <button id="r2off" class="off" onclick="send('/relay2?off')">OFF</button>
+        </div>
+      </div>
+      <div class="cell">
+        <div class="name">Living</div>
+        <div class="row">
+          <button id="r3on" onclick="send('/relay3?on')">ON</button>
+          <button id="r3off" class="off" onclick="send('/relay3?off')">OFF</button>
+        </div>
+      </div>
+    </div>
+    <div class="footer">Served by Embassy + esp-wifi</div>
+  </div>
+</body>
+</html>
