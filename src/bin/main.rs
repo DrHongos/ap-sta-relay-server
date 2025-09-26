@@ -32,6 +32,7 @@ use embassy_net::{
 use esp_wifi::wifi::{AccessPointConfiguration, Configuration, WifiDevice, ClientConfiguration, WifiController, WifiState, WifiEvent};
 use esp_wifi::{init, EspWifiController};
 use embedded_io_async::Write;
+use embassy_futures::select::Either;
 
 //use esp_hal::gpio::{DriveMode, Level, Output, OutputConfig};
 
@@ -51,16 +52,21 @@ macro_rules! mk_static {
     }};
 }
 
-
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
+const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
+
+const SSID_HOME: &'static str = "Avatel_bVY3";
+const BSSID_HOME: &'static str = "3XDzF9vp";
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // generator version: 0.5.0
 
     esp_println::logger::init_logger_from_env();
+
+    // prepare pages (and later relays)
+    const PAGE: &str = include_str!("../html/index.html");
+    const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -84,48 +90,43 @@ async fn main(spawner: Spawner) {
         .expect("Failed to initialize WIFI controller");
 
     let wifi_ap_device = interfaces.ap;
-//    let wifi_sta_device = interfaces.sta;
+    let wifi_sta_device = interfaces.sta;
+
     let gw_ip_addr_str = "192.168.2.1";
     let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).unwrap();
-
     let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(gw_ip_addr, 24),
         gateway: Some(gw_ip_addr),
         dns_servers: Default::default(),
     });
-//    let sta_config = embassy_net::Config::dhcpv4(Default::default());
 
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+    // TODO: dual mode seems to break everything
+    // AP used to work, until i branched both ways down here..
 
     let (ap_stack, ap_runner) = embassy_net::new(
         wifi_ap_device,
         ap_config,
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
-    );
-    /* 
-    let (sta_stack, sta_runner) = embassy_net::new(
-        wifi_sta_device,
-        sta_config,
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
-        seed,
     ); 
-    */
-// Reading config
-    
+
+        // Reading config    
     // cannot use nvs without the safe api
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
 
-
-    // use this to set the client_config based on wifi config
     let mut start_wifi = false;
     let client_config = if let Some((ssid, bssid)) = get_wifi_config(&mut flash).await {
-        info!("WiFi configured! {}:{}", ssid, bssid);
+        info!("WiFi configured! {:?}:{:?}", ssid.as_bytes(), bssid.as_bytes());
+        let ssidn =  bytes_to_clean_string(ssid.as_bytes()).unwrap_or(String::new());
+        let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
+        
         start_wifi = true;
         Configuration::Mixed(
             ClientConfiguration {
-                ssid: ssid.into(),
-                password: bssid.into(),
+                ssid: ssidn.into(),
+                password: bssidn.into(),
                 ..Default::default()
             },
             AccessPointConfiguration {
@@ -134,7 +135,7 @@ async fn main(spawner: Spawner) {
             },
         )
     } else {
-        info!("Wifi not configured yet");
+        info!("Wifi not configured yet, starting only AP");
         Configuration::AccessPoint(
             AccessPointConfiguration {
                 ssid: "esp-wifi".into(),
@@ -143,17 +144,27 @@ async fn main(spawner: Spawner) {
         )
     };
     controller.set_configuration(&client_config).unwrap();
+    
 
-   // let led = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
-   // spawner.spawn(blink(led)).ok();
-
-    spawner.spawn(connection(controller)).ok();
-    spawner.spawn(net_task(ap_runner)).ok();
-
-    if start_wifi {
+    // this is what i think breaks all (spawned task arent running)
+    let sta_stack = if start_wifi {
         info!("Connecting to WiFi network");
-        /* 
-        //spawner.spawn(net_task(sta_runner)).ok();
+        // if only AP, this must NOT run
+        let sta_config = embassy_net::Config::dhcpv4(Default::default());
+        let (sta_stack, sta_runner) = embassy_net::new(
+            wifi_sta_device,
+            sta_config,
+            mk_static!(StackResources<4>, StackResources::<4>::new()),
+            seed,
+        ); 
+
+   
+        spawner.spawn(dual_connection(controller)).ok();
+        spawner.spawn(net_task(sta_runner)).ok();
+        spawner.spawn(net_task(ap_runner)).ok();
+    
+        let max_connection_attempts = 50;
+        let mut attempt = 0;
         let sta_address = loop {
             if let Some(config) = sta_stack.config_v4() {
                 let address = config.address.address();
@@ -162,111 +173,210 @@ async fn main(spawner: Spawner) {
             }
             info!("Waiting for IP...");
             Timer::after(Duration::from_millis(500)).await;
+            attempt +=1;
+            if attempt == max_connection_attempts {
+                info!("Incorrect credentials, deleting..");
+                let _ = sequential_storage::erase_all(&mut flash, NVS_FLASH_RANGE).await;
+                esp_hal::system::software_reset();
+            }
         };
+        info!("Connected to {}", sta_address);
         loop {
             if ap_stack.is_link_up() {
                 break;
             }
             Timer::after(Duration::from_millis(500)).await;
         }
-     */
+        Some(sta_stack)
     } else {
+
+        spawner.spawn(connection(controller)).ok();
+        // if no sta, a dhcp service is required
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
-
-    }
-
-    // prepare pages (and later relays)
-    const PAGE: &str = include_str!("../html/index.html");
-    const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
+        spawner.spawn(net_task(ap_runner)).ok();
+        None
+    };
 
     let mut ap_rx_buffer = [0; 1536];
     let mut ap_tx_buffer = [0; 1536];
+    let mut sta_rx_buffer = [0; 1536];
+    let mut sta_tx_buffer = [0; 1536];
+  
     let mut socket = TcpSocket::new(ap_stack, &mut ap_rx_buffer, &mut ap_tx_buffer);
     socket.set_timeout(Some(Duration::from_secs(10)));
 
-/* 
-    let mut sta_rx_buffer = [0; 1536];
-    let mut sta_tx_buffer = [0; 1536];
-    let mut sta_server_socket = TcpSocket::new(
-        sta_stack,
-        &mut sta_server_rx_buffer,
-        &mut sta_server_tx_buffer,
-    );
-    sta_server_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
- */
-
-    info!("Connect to the AP `esp-wifi` and point your browser to http://192.168.2.1:8080/");
     
-    loop {
-        // TODO: this is only AP
-        // use it to set wifi credentials and restart
-
-        // in dual mode, check connection, if fails, do this again
-        // if connects to wifi, then present PAGE with the relays control 
-
-        info!("Wait for connection...");
-        let r = socket
-            .accept(IpListenEndpoint {
-                addr: None,
-                port: 8080,
-            })
-            .await;
-        info!("Connected...");
-
-        if let Err(e) = r {
-            info!("connect error: {:?}", e);
-            continue;
-        }
-
-        let mut buffer = [0u8; 1024];
-        let mut pos = 0;
+    if !start_wifi {
+        
         loop {
-            match socket.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("read EOF");
-                    break;
-                }
-                Ok(len) => {
-                    let to_print =
-                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-
-                    if to_print.contains("\r\n\r\n") {
-                        info!("{}", to_print);
+            info!("Wait for connection...");
+            let r = socket
+                .accept(IpListenEndpoint {
+                    addr: None,
+                    port: 8080,
+                })
+                .await;
+            info!("Connected...");
+    
+            if let Err(e) = r {
+                info!("connect error: {:?}", e);
+                continue;
+            }
+    
+            let mut buffer = [0u8; 1024];
+            let mut pos = 0;
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) => {
+                        info!("read EOF");
                         break;
                     }
-
-                    pos += len;
-                }
-                Err(e) => {
-                    info!("read error: {:?}", e);
-                    break;
-                }
-            };
+                    Ok(len) => {
+                        let to_print =
+                            unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+    
+                        // maybe here i need to filter different requests?
+                        info!("to_print: {}", to_print);
+                        let first_line = to_print.lines().next().unwrap_or("");
+                        info!("first_line: {}", first_line);
+    
+                        if first_line.starts_with("POST /save HTTP/1.1") {
+                            // parse and store
+                            info!("Received {}", first_line);
+                            if let Some(body) = extract_body(to_print) {
+                                if let Some((ssid, bssid)) = parse_form(body) {
+                                    info!("Storing ssid:{} & bssid: {}", ssid, bssid);
+                                    store_credentials(&mut flash, ssid, bssid).await;
+                                    info!("restart..");
+                                    esp_hal::system::software_reset();                           
+                                }
+                            }
+                        }                    
+                        if to_print.contains("\r\n\r\n") {
+                            info!("{}", to_print);
+                            break;
+                        }
+    
+    
+    
+                        pos += len;
+                    }
+                    Err(e) => {
+                        info!("read error: {:?}", e);
+                        break;
+                    }
+                };
+            }
+            // prepare response
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                CRED_PAGE.len(),
+                CRED_PAGE
+            );
+            let r = socket.write_all(resp.as_bytes()).await;
+    
+            if let Err(e) = r {
+                info!("write error: {:?}", e);
+            }
+    
+            let r = socket.flush().await;
+            if let Err(e) = r {
+                info!("flush error: {:?}", e);
+            }
+            Timer::after(Duration::from_millis(1000)).await;
+    
+            socket.close();
+            Timer::after(Duration::from_millis(1000)).await;
+    
+            socket.abort();
         }
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
-            CRED_PAGE.len(),
-            CRED_PAGE
+        
+    } else {
+        info!("Enters to wifi part");        
+        let mut sta_server_socket = TcpSocket::new(
+            sta_stack.unwrap(),
+            &mut sta_rx_buffer,
+            &mut sta_tx_buffer,
         );
-        let r = socket.write_all(resp.as_bytes()).await;
+        sta_server_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
-        if let Err(e) = r {
-            info!("write error: {:?}", e);
+        // find what breaks AP     
+        loop {
+            // test handling only one socket (like AP below)
+                // initiating any socket in here breaks AP (strange cause it should go through)
+                // it doesnt matter where in the code is
+        /* 
+            // this line seems to break AP
+            let either_socket = embassy_futures::select::select(
+                socket.accept(IpListenEndpoint {
+                    addr: None,
+                    port: 8080,
+                }),
+                sta_server_socket.accept(IpListenEndpoint {
+                    addr: None,
+                    port: 8080,
+                }),
+            )
+            .await;
+            let (r, server_socket) = match either_socket {
+                Either::First(r) => (r, &mut socket),
+                Either::Second(r) => (r, &mut sta_server_socket),
+            };
+            info!("Connected...");
+            if let Err(e) = r {
+            info!("connect error: {:?}", e);
+                continue;
+            }
+            let mut buffer = [0u8; 1024];
+            let mut pos = 0;
+            loop {
+                match server_socket.read(&mut buffer).await {
+                    Ok(0) => {
+                        info!("AP read EOF");
+                        break;
+                    }
+                    Ok(len) => {
+                        let to_print =
+                            unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+
+                        if to_print.contains("\r\n\r\n") {
+                            info!("{}", to_print);
+                            break;
+                        }
+
+                        pos += len;
+                    }
+                    Err(e) => {
+                        info!("AP read error: {:?}", e);
+                        break;
+                    }
+                };
+            }            
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                PAGE.len(),
+                PAGE
+            );
+            let r = server_socket.write_all(resp.as_bytes()).await;
+    
+            if let Err(e) = r {
+                info!("write error: {:?}", e);
+            }
+    
+            let r = server_socket.flush().await;
+            if let Err(e) = r {
+                info!("flush error: {:?}", e);
+            }
+            Timer::after(Duration::from_millis(1000)).await;
+    
+            server_socket.close();
+            Timer::after(Duration::from_millis(1000)).await;
+    
+            server_socket.abort();
+             */
         }
-
-        let r = socket.flush().await;
-        if let Err(e) = r {
-            info!("flush error: {:?}", e);
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-
-        socket.close();
-        Timer::after(Duration::from_millis(1000)).await;
-
-        socket.abort();
-
+    
     }
-
 
 }
 
@@ -278,7 +388,6 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 async fn get_wifi_config(mut flash: &mut impl NorFlash) -> Option<(String, String)> {
     let mut ssid_buffer = [0; 32];
     let mut bssid_buffer = [0; 32];
-    const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
 
     if let Some(ssid) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
         &mut flash,
@@ -305,10 +414,74 @@ async fn get_wifi_config(mut flash: &mut impl NorFlash) -> Option<(String, Strin
         None
     }
 }
-/* 
-dual mode connection
+
+async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: String) {
+    const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
+    let mut ssid_buffer = [0; 32];
+    let mut bssid_buffer = [0; 32];
+
+     sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut ssid_buffer,
+        &0,
+        &ssid.as_bytes(),
+    ).await.unwrap();
+    sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut bssid_buffer,
+        &1,
+        &bssid.as_bytes(),
+    ).await.unwrap();   
+}
+
+// another connection example TODO: test it
 #[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
+async fn other_connection(mut controller: WifiController<'static>) {
+    log::info!("start connection task");
+    log::info!("Device capabilities: {:?}", controller.capabilities());
+    loop {
+        match esp_wifi::wifi::wifi_state() {
+            WifiState::StaConnected => {
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                Timer::after(Duration::from_millis(5000)).await
+            }
+            _ => {}
+        }
+        if !matches!(controller.is_started(), Ok(true)) {
+            log::info!("Starting wifi");
+            controller.start_async().await.unwrap();
+            log::info!("Wifi started!");
+
+            log::info!("Scan");
+            let scan_config = esp_wifi::wifi::ScanConfig::default();
+            let result = controller
+                .scan_with_config_async(scan_config)
+                .await
+                .unwrap();
+            for ap in result {
+                log::info!("{:?}", ap);
+            }
+        }
+        log::info!("About to connect...");
+
+        match controller.connect_async().await {
+            Ok(_) => log::info!("Wifi connected!"),
+            Err(e) => {
+                log::info!("Failed to connect to wifi: {e:?}");
+                Timer::after(Duration::from_millis(5000)).await
+            }
+        }
+    }
+}
+
+
+#[embassy_executor::task]
+async fn dual_connection(mut controller: WifiController<'static>) {
     info!("start connection task");
     info!("Device capabilities: {:?}", controller.capabilities());
 
@@ -337,7 +510,6 @@ async fn connection(mut controller: WifiController<'static>) {
         }
     }
 } 
-*/
 
 //this is the fn in the only AP example (https://github.com/esp-rs/esp-hal/blob/esp-hal-v1.0.0-rc.0/examples/src/bin/wifi_embassy_access_point.rs)
 #[embassy_executor::task]
@@ -365,31 +537,6 @@ async fn connection(mut controller: WifiController<'static>) {
         }
     }
 }
-
-/*  
-   TEST WRITES (convert to a function for later)
-    let mut ssid_buffer = [0; 32];
-    let mut bssid_buffer = [0; 32];
-    const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
-    let ssid_value = alloc::string::String::from("my_wifi");
-    let bssid_value = alloc::string::String::from("my_password");
-    sequential_storage::map::store_item(
-        &mut flash,
-        NVS_FLASH_RANGE.clone(),
-        &mut NoCache::new(),
-        &mut ssid_buffer,
-        &0,
-        &ssid_value.as_bytes(),
-    ).await.unwrap();
-    sequential_storage::map::store_item(
-        &mut flash,
-        NVS_FLASH_RANGE.clone(),
-        &mut NoCache::new(),
-        &mut bssid_buffer,
-        &1,
-        &bssid_value.as_bytes(),
-    ).await.unwrap();
- */
 
 #[embassy_executor::task]
 async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
@@ -430,4 +577,44 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
         .inspect_err(|e| log::warn!("DHCP server error: {e:?}"));
         Timer::after(Duration::from_millis(500)).await;
     }
+}
+fn extract_body(request: &str) -> Option<&str> {
+    request.split("\r\n\r\n").nth(1)
+}
+
+/// Parses URL-encoded form body into key-value pairs.
+/// Very naive (does not handle %xx decoding).
+fn parse_form(body: &str) -> Option<(String, String)> {
+    let mut ssid = "";
+    let mut bssid= "";
+    let mut index = 0;
+    for pair in body.split('&') {
+        let mut iter = pair.splitn(2, '=');
+        let _key = iter.next().unwrap_or("");
+        let val = iter.next().unwrap_or("");
+        if index == 0 {
+            ssid = val;
+        } else {
+            bssid = val;
+        }
+        index += 1;
+        //return Some((String::from(key), String::from(val)))
+    }
+    Some((ssid.to_string(), bssid.to_string()))
+}
+
+fn bytes_to_clean_string(data: &[u8]) -> Option<String> {
+    let start = data.iter().position(|&b| b != 0).unwrap_or(data.len());
+    let end = data[start..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|pos| start + pos)
+        .unwrap_or(data.len());
+
+    if start >= end {
+        return None;
+    }
+
+    let slice = &data[start..end];
+    core::str::from_utf8(slice).ok().map(String::from)
 }

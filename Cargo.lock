@@ -24,6 +24,7 @@ dependencies = [
  "edge-nal-embassy",
  "embassy-embedded-hal 0.5.0",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-time 0.5.0",
  "embedded-io",
