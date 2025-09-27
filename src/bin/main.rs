@@ -16,6 +16,7 @@ use log::info;
 use alloc::string::{String, ToString};
 use alloc::format;
 
+use core::fmt::Error;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 use esp_storage::FlashStorage;
@@ -33,6 +34,7 @@ use esp_wifi::wifi::{AccessPointConfiguration, Configuration, WifiDevice, Client
 use esp_wifi::{init, EspWifiController};
 use embedded_io_async::Write;
 use embassy_futures::select::Either;
+use static_cell::StaticCell;
 
 //use esp_hal::gpio::{DriveMode, Level, Output, OutputConfig};
 
@@ -45,7 +47,7 @@ extern crate alloc;
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        static STATIC_CELL: StaticCell<$t> = StaticCell::new();
         #[deny(unused_attributes)]
         let x = STATIC_CELL.uninit().write(($val));
         x
@@ -58,6 +60,11 @@ const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
 const SSID_HOME: &'static str = "Avatel_bVY3";
 const BSSID_HOME: &'static str = "3XDzF9vp";
 
+static AP_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
+static AP_TX_BUFFER : StaticCell<[u8; 1536]>= StaticCell::new();
+static STA_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
+static STA_TX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
+
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // generator version: 0.5.0
@@ -65,8 +72,6 @@ async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
 
     // prepare pages (and later relays)
-    const PAGE: &str = include_str!("../html/index.html");
-    const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -105,35 +110,30 @@ async fn main(spawner: Spawner) {
     // TODO: dual mode seems to break everything
     // AP used to work, until i branched both ways down here..
 
-    let (ap_stack, ap_runner) = embassy_net::new(
-        wifi_ap_device,
-        ap_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
-        seed,
-    ); 
 
         // Reading config    
     // cannot use nvs without the safe api
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
-
+ 
     let mut start_wifi = false;
     let client_config = if let Some((ssid, bssid)) = get_wifi_config(&mut flash).await {
-        info!("WiFi configured! {:?}:{:?}", ssid.as_bytes(), bssid.as_bytes());
         let ssidn =  bytes_to_clean_string(ssid.as_bytes()).unwrap_or(String::new());
         let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
+        info!("WiFi configured! {}:{}", ssidn, bssidn);
         
         start_wifi = true;
-        Configuration::Mixed(
-            ClientConfiguration {
+        //Configuration::Mixed(
+            Configuration::Client(ClientConfiguration {
                 ssid: ssidn.into(),
                 password: bssidn.into(),
                 ..Default::default()
-            },
-            AccessPointConfiguration {
-                ssid: "esp-wifi".into(),
-                ..Default::default()
-            },
-        )
+            })
+        //    ,
+        //    AccessPointConfiguration {
+        //        ssid: "esp-wifi".into(),
+        //        ..Default::default()
+        //    },
+        //)
     } else {
         info!("Wifi not configured yet, starting only AP");
         Configuration::AccessPoint(
@@ -144,70 +144,28 @@ async fn main(spawner: Spawner) {
         )
     };
     controller.set_configuration(&client_config).unwrap();
+        
+    let (ap_stack, ap_runner) = embassy_net::new(
+        wifi_ap_device,
+        ap_config,
+        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        seed,
+    ); 
     
+    //loop {}
 
-    // this is what i think breaks all (spawned task arent running)
-    let sta_stack = if start_wifi {
-        info!("Connecting to WiFi network");
-        // if only AP, this must NOT run
-        let sta_config = embassy_net::Config::dhcpv4(Default::default());
-        let (sta_stack, sta_runner) = embassy_net::new(
-            wifi_sta_device,
-            sta_config,
-            mk_static!(StackResources<4>, StackResources::<4>::new()),
-            seed,
-        ); 
-
-   
-        spawner.spawn(dual_connection(controller)).ok();
-        spawner.spawn(net_task(sta_runner)).ok();
-        spawner.spawn(net_task(ap_runner)).ok();
-    
-        let max_connection_attempts = 50;
-        let mut attempt = 0;
-        let sta_address = loop {
-            if let Some(config) = sta_stack.config_v4() {
-                let address = config.address.address();
-                info!("Got IP: {}", address);
-                break address;
-            }
-            info!("Waiting for IP...");
-            Timer::after(Duration::from_millis(500)).await;
-            attempt +=1;
-            if attempt == max_connection_attempts {
-                info!("Incorrect credentials, deleting..");
-                let _ = sequential_storage::erase_all(&mut flash, NVS_FLASH_RANGE).await;
-                esp_hal::system::software_reset();
-            }
-        };
-        info!("Connected to {}", sta_address);
-        loop {
-            if ap_stack.is_link_up() {
-                break;
-            }
-            Timer::after(Duration::from_millis(500)).await;
-        }
-        Some(sta_stack)
-    } else {
-
+    // TODO refactor this both cases into tasks 
+    if !start_wifi {
+        info!("Spawning ap");
         spawner.spawn(connection(controller)).ok();
-        // if no sta, a dhcp service is required
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
-        None
-    };
-
-    let mut ap_rx_buffer = [0; 1536];
-    let mut ap_tx_buffer = [0; 1536];
-    let mut sta_rx_buffer = [0; 1536];
-    let mut sta_tx_buffer = [0; 1536];
-  
-    let mut socket = TcpSocket::new(ap_stack, &mut ap_rx_buffer, &mut ap_tx_buffer);
-    socket.set_timeout(Some(Duration::from_secs(10)));
-
+    // spawner.spawn(run_ap(ap_stack)).unwrap(); // this method fails, invalid AP state
     
-    if !start_wifi {
-        
+        let rx_buf = AP_RX_BUFFER.init([0; 1536]);
+        let tx_buf = AP_TX_BUFFER.init([0; 1536]);
+        let mut socket = TcpSocket::new(ap_stack, rx_buf, tx_buf);
+        socket.set_timeout(Some(Duration::from_secs(10)));
         loop {
             info!("Wait for connection...");
             let r = socket
@@ -268,6 +226,8 @@ async fn main(spawner: Spawner) {
                 };
             }
             // prepare response
+            const PAGE: &str = include_str!("../html/index.html");
+            const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
                 CRED_PAGE.len(),
@@ -290,38 +250,86 @@ async fn main(spawner: Spawner) {
     
             socket.abort();
         }
-        
     } else {
-        info!("Enters to wifi part");        
-        let mut sta_server_socket = TcpSocket::new(
-            sta_stack.unwrap(),
-            &mut sta_rx_buffer,
-            &mut sta_tx_buffer,
-        );
-        sta_server_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
-        // find what breaks AP     
+        // once again
+        // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
+        // cannot use the loop, try again
+        info!("Connecting to WiFi network");
+        let sta_config = embassy_net::Config::dhcpv4(Default::default());
+        let (sta_stack, sta_runner) = embassy_net::new(
+            wifi_sta_device,
+            sta_config,
+            mk_static!(StackResources<4>, StackResources::<4>::new()),
+            seed,
+        ); 
+
+   
+        spawner.spawn(dual_connection(controller)).ok();
+// the order below matters, if sta is after ap, it wont get to connect STA
+        spawner.spawn(net_task(sta_runner)).ok();
+        //spawner.spawn(net_task(ap_runner)).ok();
+        
+// this blocks the loop.. seems like ap never starts
         loop {
-            // test handling only one socket (like AP below)
-                // initiating any socket in here breaks AP (strange cause it should go through)
-                // it doesnt matter where in the code is
-        /* 
-            // this line seems to break AP
-            let either_socket = embassy_futures::select::select(
-                socket.accept(IpListenEndpoint {
+            if sta_stack.is_link_up() {
+                break;
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }
+        let max_connection_attempts = 50;
+        let mut attempt = 0;
+        let sta_address = loop {
+            if let Some(config) = sta_stack.config_v4() {
+                let address = config.address.address();
+                info!("Got IP: {}", address);
+                break address;
+            }
+            info!("Waiting for IP...");
+            Timer::after(Duration::from_millis(500)).await;
+            attempt +=1;
+            if attempt == max_connection_attempts {
+                info!("Incorrect credentials, deleting..");
+                let _ = sequential_storage::erase_all(&mut flash, NVS_FLASH_RANGE).await;
+                esp_hal::system::software_reset();
+            }
+        };
+        info!("Connected to {}", sta_address);
+
+
+        //        spawner.spawn(run_sta(sta_stack)).unwrap();
+
+        //let rx_buf1 = AP_RX_BUFFER.init([0; 1536]);
+        //let tx_buf1 = AP_TX_BUFFER.init([0; 1536]);
+        //let mut socket = TcpSocket::new(ap_stack, rx_buf1, tx_buf1);
+        //socket.set_timeout(Some(Duration::from_secs(10)));
+        let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
+        let tx_buf2 = STA_TX_BUFFER.init([0; 1536]);
+        let mut sta_server_socket = TcpSocket::new(sta_stack, rx_buf2, tx_buf2);
+        sta_server_socket.set_timeout(Some(Duration::from_secs(10)));
+
+        info!("Starts listener");
+        // this below doesnt work
+        loop {
+            info!("Inside log"); // never shows
+         //   Timer::after(Duration::from_secs(1)).await;
+
+         let server_socket = &mut sta_server_socket;
+            let r = //embassy_futures::select::select(
+            //    socket.accept(IpListenEndpoint {
+            //        addr: None,
+            //        port: 8080,
+            //    }),
+                server_socket.accept(IpListenEndpoint {
                     addr: None,
                     port: 8080,
-                }),
-                sta_server_socket.accept(IpListenEndpoint {
-                    addr: None,
-                    port: 8080,
-                }),
+                }
             )
             .await;
-            let (r, server_socket) = match either_socket {
-                Either::First(r) => (r, &mut socket),
-                Either::Second(r) => (r, &mut sta_server_socket),
-            };
+            //let (r, server_socket) = match either_socket {
+            //    Either::First(r) => (r, &mut socket),
+            //    Either::Second(r) => (r, &mut sta_server_socket),
+            //};
             info!("Connected...");
             if let Err(e) = r {
             info!("connect error: {:?}", e);
@@ -352,6 +360,7 @@ async fn main(spawner: Spawner) {
                     }
                 };
             }            
+            const PAGE: &str = include_str!("../html/index.html");
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
                 PAGE.len(),
@@ -373,11 +382,10 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_millis(1000)).await;
     
             server_socket.abort();
-             */
+            
         }
     
     }
-
 }
 
 #[embassy_executor::task]
@@ -490,8 +498,8 @@ async fn dual_connection(mut controller: WifiController<'static>) {
     info!("Wifi started!");
 
     loop {
-        match esp_wifi::wifi::ap_state() {
-            WifiState::ApStarted => {
+//        match esp_wifi::wifi::ap_state() {
+//            WifiState::ApStarted => {
                 info!("About to connect...");
 
                 match controller.connect_async().await {
@@ -505,9 +513,9 @@ async fn dual_connection(mut controller: WifiController<'static>) {
                         Timer::after(Duration::from_millis(5000)).await
                     }
                 }
-            }
-            _ => return,
-        }
+//            }
+//            _ => return,
+//        }
     }
 } 
 
@@ -526,11 +534,11 @@ async fn connection(mut controller: WifiController<'static>) {
             _ => {}
         }
         if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = Configuration::AccessPoint(AccessPointConfiguration {
-                ssid: "esp-wifi".try_into().unwrap(),
-                ..Default::default()
-            });
-            controller.set_configuration(&client_config).unwrap();
+            //let client_config = Configuration::AccessPoint(AccessPointConfiguration {
+            //    ssid: "esp-wifi".try_into().unwrap(),
+            //    ..Default::default()
+            //});
+            //controller.set_configuration(&client_config).unwrap();
             info!("Starting wifi");
             controller.start_async().await.unwrap();
             info!("Wifi started!");
@@ -617,4 +625,101 @@ fn bytes_to_clean_string(data: &[u8]) -> Option<String> {
 
     let slice = &data[start..end];
     core::str::from_utf8(slice).ok().map(String::from)
+}
+
+
+
+#[embassy_executor::task]
+async fn run_ap(stack: Stack<'static>/* , mut flash: FlashStorage */) {
+    let rx_buf = AP_RX_BUFFER.init([0; 1536]);
+    let tx_buf = AP_TX_BUFFER.init([0; 1536]);
+
+    let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    socket.set_timeout(Some(Duration::from_secs(10)));
+
+    loop {
+        info!("AP waiting for connection...");
+        let r = socket.accept(IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        }).await;
+
+        if let Err(e) = r {
+            info!("AP connect error: {:?}", e);
+            continue;
+        }
+        info!("AP client connected");
+
+        if let Err(e) = handle_client(&mut socket, None/* Some(&mut flash) */, true).await {
+            info!("AP client error: {:?}", e);
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn run_sta(stack: Stack<'static>) {
+    let rx_buf = STA_RX_BUFFER.init([0; 1536]);
+    let tx_buf = STA_TX_BUFFER.init([0; 1536]);
+    let mut sta_socket = TcpSocket::new(
+        stack,
+        rx_buf,
+        tx_buf,
+    );
+    sta_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    loop {
+        info!("STA waiting for connection...");
+        let r = sta_socket.accept(IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        }).await;
+
+        if let Err(e) = r {
+            info!("STA connect error: {:?}", e);
+            continue;
+        }
+        info!("STA client connected");
+
+        if let Err(e) = handle_client(&mut sta_socket, None, false).await {
+            info!("STA client error: {:?}", e);
+        }
+    }
+}
+
+/// Common handler
+async fn handle_client(
+    socket: &mut TcpSocket<'static>,
+    flash: Option<&mut FlashStorage>,
+    is_ap: bool,
+) -> Result<(), Error> {
+    let mut buffer = [0u8; 1024];
+    let len = socket.read(&mut buffer).await.expect("Error reading socket");
+    if len == 0 {
+        return Ok(());
+    }
+    const PAGE: &str = include_str!("../html/index.html");
+    const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
+
+    let req = core::str::from_utf8(&buffer[..len]).unwrap_or("");
+    let first_line = req.lines().next().unwrap_or("");
+    info!("Request: {}", first_line);
+
+    if is_ap && first_line.starts_with("POST /save") {
+        if let Some(body) = extract_body(req) {
+            if let Some((ssid, bssid)) = parse_form(body) {
+                //let flash = flash.unwrap();
+                //store_credentials(flash, ssid, bssid).await;
+                esp_hal::system::software_reset();
+            }
+        }
+    }
+
+    let page = if is_ap { CRED_PAGE } else { PAGE };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+        page.len(),
+        page
+    );
+    socket.write_all(resp.as_bytes()).await.expect("Error writing response");
+    socket.flush().await.expect("Error flushing response");
+    Ok(())
 }
