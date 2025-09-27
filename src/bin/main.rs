@@ -33,10 +33,10 @@ use embassy_net::{
 use esp_wifi::wifi::{AccessPointConfiguration, Configuration, WifiDevice, ClientConfiguration, WifiController, WifiState, WifiEvent};
 use esp_wifi::{init, EspWifiController};
 use embedded_io_async::Write;
-use embassy_futures::select::Either;
+//use embassy_futures::select::Either;
 use static_cell::StaticCell;
 
-//use esp_hal::gpio::{DriveMode, Level, Output, OutputConfig};
+use esp_hal::gpio::{Level, Output, OutputConfig};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -53,6 +53,52 @@ macro_rules! mk_static {
         x
     }};
 }
+
+static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
+pub struct Relays {
+    pub r1: Output<'static>,
+    pub r2: Output<'static>,
+    pub r3: Output<'static>,
+    pub s1: bool,
+    pub s2: bool,
+    pub s3: bool,
+}
+impl Relays {
+    fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
+        Self { r1, r2, r3, s1: false, s2: false, s3: false }
+    }
+
+    fn on(&mut self, idx: u8) {
+        match idx {
+            1 => { self.r1.set_high(); self.s1 = true; }
+            2 => { self.r2.set_high(); self.s2 = true; }
+            3 => { self.r3.set_high(); self.s3 = true; }
+            _ => {}
+        }
+    }
+
+    fn off(&mut self, idx: u8) {
+        match idx {
+            1 => { self.r1.set_low(); self.s1 = false; }
+            2 => { self.r2.set_low(); self.s2 = false; }
+            3 => { self.r3.set_low(); self.s3 = false; }
+            _ => {}
+        }
+    }
+
+    fn json_status(&self) -> heapless::String<128> {
+        // use heapless string since no_std
+        let mut s = heapless::String::<128>::new();
+        use core::fmt::Write;
+        let _ = write!(
+            s,
+            "{{\"relay1\":{},\"relay2\":{},\"relay3\":{}}}",
+            self.s1, self.s2, self.s3
+        );
+        s
+    }
+}
+
 
 esp_bootloader_esp_idf::esp_app_desc!();
 const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
@@ -107,10 +153,6 @@ async fn main(spawner: Spawner) {
 
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // TODO: dual mode seems to break everything
-    // AP used to work, until i branched both ways down here..
-
-
         // Reading config    
     // cannot use nvs without the safe api
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
@@ -122,18 +164,18 @@ async fn main(spawner: Spawner) {
         info!("WiFi configured! {}:{}", ssidn, bssidn);
         
         start_wifi = true;
-        //Configuration::Mixed(
-            Configuration::Client(ClientConfiguration {
+        Configuration::Mixed(
+        //    Configuration::Client(
+            ClientConfiguration {
                 ssid: ssidn.into(),
                 password: bssidn.into(),
                 ..Default::default()
-            })
-        //    ,
-        //    AccessPointConfiguration {
-        //        ssid: "esp-wifi".into(),
-        //        ..Default::default()
-        //    },
-        //)
+            },
+            AccessPointConfiguration {
+                ssid: "esp-wifi".into(),
+                ..Default::default()
+            },
+        )
     } else {
         info!("Wifi not configured yet, starting only AP");
         Configuration::AccessPoint(
@@ -152,9 +194,7 @@ async fn main(spawner: Spawner) {
         seed,
     ); 
     
-    //loop {}
-
-    // TODO refactor this both cases into tasks 
+    // TODO refactor this both cases into tasks (didnt work well)
     if !start_wifi {
         info!("Spawning ap");
         spawner.spawn(connection(controller)).ok();
@@ -226,7 +266,6 @@ async fn main(spawner: Spawner) {
                 };
             }
             // prepare response
-            const PAGE: &str = include_str!("../html/index.html");
             const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
@@ -251,10 +290,10 @@ async fn main(spawner: Spawner) {
             socket.abort();
         }
     } else {
-
         // once again
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
-        // cannot use the loop, try again
+        // and printing: WARN - Unable to allocate 1700 bytes
+
         info!("Connecting to WiFi network");
         let sta_config = embassy_net::Config::dhcpv4(Default::default());
         let (sta_stack, sta_runner) = embassy_net::new(
@@ -265,18 +304,28 @@ async fn main(spawner: Spawner) {
         ); 
 
    
-        spawner.spawn(dual_connection(controller)).ok();
+        spawner.spawn(other_connection(controller)).ok();
 // the order below matters, if sta is after ap, it wont get to connect STA
         spawner.spawn(net_task(sta_runner)).ok();
         //spawner.spawn(net_task(ap_runner)).ok();
         
-// this blocks the loop.. seems like ap never starts
         loop {
             if sta_stack.is_link_up() {
                 break;
             }
+            info!("STA not connected");
             Timer::after(Duration::from_millis(500)).await;
         }
+       /* 
+        AP doesnt connect ever
+        loop {
+            if ap_stack.is_link_up() {
+                break;
+            }
+            info!("AP not connected");
+            Timer::after(Duration::from_millis(500)).await;
+        }
+        */
         let max_connection_attempts = 50;
         let mut attempt = 0;
         let sta_address = loop {
@@ -301,88 +350,109 @@ async fn main(spawner: Spawner) {
 
         //let rx_buf1 = AP_RX_BUFFER.init([0; 1536]);
         //let tx_buf1 = AP_TX_BUFFER.init([0; 1536]);
-        //let mut socket = TcpSocket::new(ap_stack, rx_buf1, tx_buf1);
-        //socket.set_timeout(Some(Duration::from_secs(10)));
+        //let mut ap_socket = TcpSocket::new(ap_stack, rx_buf1, tx_buf1);
+        //ap_socket.set_timeout(Some(Duration::from_secs(10)));
         let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
         let tx_buf2 = STA_TX_BUFFER.init([0; 1536]);
-        let mut sta_server_socket = TcpSocket::new(sta_stack, rx_buf2, tx_buf2);
-        sta_server_socket.set_timeout(Some(Duration::from_secs(10)));
+        let mut socket = TcpSocket::new(sta_stack, rx_buf2, tx_buf2);
+        socket.set_timeout(Some(Duration::from_secs(10)));
+
+        let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+        let r2 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
+        let r3 = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+        let relays: &'static mut Relays = RELAYS_CELL.init(
+            Relays::new(r1, r2, r3)
+        );
+
+        const PAGE: &str = include_str!("../html/index.html");
 
         info!("Starts listener");
         // this below doesnt work
         loop {
-            info!("Inside log"); // never shows
-         //   Timer::after(Duration::from_secs(1)).await;
-
-         let server_socket = &mut sta_server_socket;
-            let r = //embassy_futures::select::select(
-            //    socket.accept(IpListenEndpoint {
+            //let socket = &mut sta_server_socket;
+            let r =
+            //let either_socket = embassy_futures::select::select(
+            //    ap_socket.accept(IpListenEndpoint {
             //        addr: None,
             //        port: 8080,
             //    }),
-                server_socket.accept(IpListenEndpoint {
+                socket.accept(IpListenEndpoint {
                     addr: None,
                     port: 8080,
                 }
             )
             .await;
             //let (r, server_socket) = match either_socket {
-            //    Either::First(r) => (r, &mut socket),
+            //    Either::First(r) => (r, &mut ap_socket),
             //    Either::Second(r) => (r, &mut sta_server_socket),
             //};
             info!("Connected...");
+           /* 
             if let Err(e) = r {
             info!("connect error: {:?}", e);
                 continue;
             }
+            */ 
             let mut buffer = [0u8; 1024];
-            let mut pos = 0;
-            loop {
-                match server_socket.read(&mut buffer).await {
-                    Ok(0) => {
-                        info!("AP read EOF");
-                        break;
-                    }
-                    Ok(len) => {
-                        let to_print =
-                            unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-
-                        if to_print.contains("\r\n\r\n") {
-                            info!("{}", to_print);
-                            break;
-                        }
-
-                        pos += len;
-                    }
-                    Err(e) => {
-                        info!("AP read error: {:?}", e);
-                        break;
-                    }
-                };
-            }            
-            const PAGE: &str = include_str!("../html/index.html");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
-                PAGE.len(),
-                PAGE
-            );
-            let r = server_socket.write_all(resp.as_bytes()).await;
-    
-            if let Err(e) = r {
-                info!("write error: {:?}", e);
-            }
-    
-            let r = server_socket.flush().await;
-            if let Err(e) = r {
-                info!("flush error: {:?}", e);
-            }
-            Timer::after(Duration::from_millis(1000)).await;
-    
-            server_socket.close();
-            Timer::after(Duration::from_millis(1000)).await;
-    
-            server_socket.abort();
             
+            let n = socket.read(&mut buffer).await.unwrap_or(0);
+            if n == 0 {
+                // client closed immediately; drop socket and listen again
+                continue;
+            }
+            let req = core::str::from_utf8(&buffer[..n]).unwrap_or("");
+            let first_line = req.lines().next().unwrap_or("");  // Route by first line, e.g.: "GET /relay1?on HTTP/1.1"
+            let mut sent = false;
+            if first_line.starts_with("GET / ") {
+                // Serve the page
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                    PAGE.len(),
+                    PAGE
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.flush().await;
+                sent = true;
+            } else if first_line.starts_with("GET /status") {
+                let body = relays.json_status();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.flush().await;
+                sent = true;
+            } else {
+                let mut handle = |idx: u8, on: bool| {
+                    if on { relays.on(idx) } else { relays.off(idx) };
+                };
+
+                // Match relay endpoints
+                match first_line {
+                    l if l.starts_with("GET /relay1?on")  => { handle(1, true);  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay1?off") => { handle(1, false); sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay2?on")  => { handle(2, true);  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay2?off") => { handle(2, false); sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay3?on")  => { handle(3, true);  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay3?off") => { handle(3, false); sent = send_ok(&mut socket).await; }
+                    _ => {}
+                }
+            }
+
+            if !sent {
+                // 404 for anything else
+                let body = "Not Found";
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+                        
+            log::info!("Response sent, closing socket");
         }
     
     }
@@ -498,8 +568,8 @@ async fn dual_connection(mut controller: WifiController<'static>) {
     info!("Wifi started!");
 
     loop {
-//        match esp_wifi::wifi::ap_state() {
-//            WifiState::ApStarted => {
+        match esp_wifi::wifi::ap_state() {
+            WifiState::ApStarted => {
                 info!("About to connect...");
 
                 match controller.connect_async().await {
@@ -513,9 +583,9 @@ async fn dual_connection(mut controller: WifiController<'static>) {
                         Timer::after(Duration::from_millis(5000)).await
                     }
                 }
-//            }
-//            _ => return,
-//        }
+            }
+            _ => return,
+        }
     }
 } 
 
@@ -722,4 +792,15 @@ async fn handle_client(
     socket.write_all(resp.as_bytes()).await.expect("Error writing response");
     socket.flush().await.expect("Error flushing response");
     Ok(())
+}
+async fn send_ok(socket: &mut embassy_net::tcp::TcpSocket<'_>) -> bool {
+    let body = "OK";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = socket.write_all(resp.as_bytes()).await;
+    let _ = socket.flush().await;
+    true
 }
