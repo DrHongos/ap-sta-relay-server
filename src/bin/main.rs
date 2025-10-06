@@ -16,7 +16,6 @@ use log::info;
 use alloc::string::{String, ToString};
 use alloc::format;
 
-use core::fmt::Error;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 use esp_storage::FlashStorage;
@@ -33,13 +32,26 @@ use embassy_net::{
 use esp_wifi::wifi::{AccessPointConfiguration, Configuration, WifiDevice, ClientConfiguration, WifiController, WifiState, WifiEvent};
 use esp_wifi::{init, EspWifiController};
 use embedded_io_async::Write;
-//use embassy_futures::select::Either;
 use static_cell::StaticCell;
 
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::Text,
+};
 
 use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::i2c::master::{Config, I2c};
 
-// add a display to show instructions
+// TODO:
+//   display 
+    // show instructions
+        // [ ] AP ("Find the wifi network xxx and connect to it, then enter 192.168.2.1")
+        // [x] STA (display the IP used)
+    // [ ] show status
+
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -127,6 +139,30 @@ async fn main(spawner: Spawner) {
 
     info!("Embassy initialized!");
 
+    // display inclusion
+    let sda = peripherals.GPIO8;   
+    let scl = peripherals.GPIO9;   
+  //  let i2c = esp_hal::i2c::master::I2c::new(peripherals.I2C0, sda, scl, 400.kHz(), &timer0).expect("Cannot get i2c interface");
+     let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
+         .with_sda(sda)
+         .with_scl(scl);
+    
+    let interface = I2CDisplayInterface::new(i2c);
+    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+    display.init().unwrap();
+    let style = MonoTextStyleBuilder::new()
+    .font(&FONT_6X10)
+    .text_color(BinaryColor::On)
+    .build();
+
+    display.clear(BinaryColor::Off).unwrap();
+    Text::new("Hello from Embassy!", Point::new(0, 16), style)
+        .draw(&mut display)
+        .unwrap();
+
+    display.flush().unwrap();
+    // end display test
 
 
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
@@ -330,7 +366,13 @@ async fn main(spawner: Spawner) {
             }
         };
         info!("Connected to {}", sta_address);
+        let ip_text = format!("Enter {}", sta_address);
+        display.clear(BinaryColor::Off).unwrap();
+        Text::new(&ip_text, Point::new(0, 16), style)
+            .draw(&mut display)
+            .unwrap();
 
+        display.flush().unwrap();
 
 
         let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
