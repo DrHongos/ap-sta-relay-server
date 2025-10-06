@@ -47,10 +47,13 @@ use esp_hal::i2c::master::{Config, I2c};
 
 // TODO:
 //   display 
+    // refactor usage (in a new task that receives messages via channel)
     // show instructions
-        // [ ] AP ("Find the wifi network xxx and connect to it, then enter 192.168.2.1")
+        // [x] AP ("Find the wifi network xxx and connect to it, then enter 192.168.2.1")
+            // add port: 8080
+        // [x] connecting sta message
         // [x] STA (display the IP used)
-    // [ ] show status
+    // [ ] show status?
 
 
 #[panic_handler]
@@ -142,28 +145,26 @@ async fn main(spawner: Spawner) {
     // display inclusion
     let sda = peripherals.GPIO8;   
     let scl = peripherals.GPIO9;   
-  //  let i2c = esp_hal::i2c::master::I2c::new(peripherals.I2C0, sda, scl, 400.kHz(), &timer0).expect("Cannot get i2c interface");
-     let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
+    let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
          .with_sda(sda)
          .with_scl(scl);
     
     let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+    let mut display: Ssd1306<I2CInterface<I2c<'_, esp_hal::Blocking>>, DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>> = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     display.init().unwrap();
     let style = MonoTextStyleBuilder::new()
-    .font(&FONT_6X10)
-    .text_color(BinaryColor::On)
-    .build();
-
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    set_text_display(&mut display, "Welcome! instructions are loading..");
+/*         
     display.clear(BinaryColor::Off).unwrap();
     Text::new("Hello from Embassy!", Point::new(0, 16), style)
         .draw(&mut display)
         .unwrap();
-
-    display.flush().unwrap();
+    display.flush().unwrap(); */
     // end display test
-
 
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
     let timer1 = TimerGroup::new(peripherals.TIMG0);
@@ -198,6 +199,7 @@ async fn main(spawner: Spawner) {
         let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
         //info!("WiFi configured! {}:{}", ssidn, bssidn);
         
+        set_text_display(&mut display, "Wifi is configured");
         start_wifi = true;
         //Configuration::Mixed(
             Configuration::Client(
@@ -213,6 +215,7 @@ async fn main(spawner: Spawner) {
         //)
     } else {
         info!("Wifi not configured yet, starting only AP");
+        set_text_display(&mut display, "Wifi is not configured");
         Configuration::AccessPoint(
             AccessPointConfiguration {
                 ssid: "esp-wifi".into(),
@@ -234,6 +237,8 @@ async fn main(spawner: Spawner) {
     // spawner.spawn(run_sta(sta_stack)).unwrap();
     if !start_wifi {
         info!("Spawning ap");
+        set_text_display(&mut display, "Connect to 'esp-wifi', find url 192.168.2.1, to configure your LAN");
+        
         spawner.spawn(ap_connection(controller)).ok();
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
@@ -329,7 +334,7 @@ async fn main(spawner: Spawner) {
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
         // and printing: WARN - Unable to allocate 1700 bytes
 
-        info!("Connecting to WiFi network");
+        set_text_display(&mut display, "Connecting to Wifi");
         let sta_config = embassy_net::Config::dhcpv4(Default::default());
         let (sta_stack, sta_runner) = embassy_net::new(
             wifi_sta_device,
@@ -367,13 +372,8 @@ async fn main(spawner: Spawner) {
         };
         info!("Connected to {}", sta_address);
         let ip_text = format!("Enter {}", sta_address);
-        display.clear(BinaryColor::Off).unwrap();
-        Text::new(&ip_text, Point::new(0, 16), style)
-            .draw(&mut display)
-            .unwrap();
-
-        display.flush().unwrap();
-
+        set_text_display(&mut display, &ip_text);
+        
 
         let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
         let tx_buf2 = STA_TX_BUFFER.init([0; 1536]);
@@ -466,6 +466,25 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
+}
+
+fn set_text_display(
+    display: &mut Ssd1306<I2CInterface<I2c<'_, esp_hal::Blocking>>, DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>>,
+    text: &str) {
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    display.clear(BinaryColor::Off).unwrap();
+    let parts = text.split(",");
+    let mut y = 16;
+    for p in parts {
+        Text::new(p.trim(), Point::new(0, y), style)
+            .draw(display)
+            .unwrap();
+        y += 16;
+    }
+    display.flush().unwrap();
 }
 
 async fn get_wifi_config(mut flash: &mut impl NorFlash) -> Option<(String, String)> {
