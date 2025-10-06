@@ -36,7 +36,10 @@ use embedded_io_async::Write;
 //use embassy_futures::select::Either;
 use static_cell::StaticCell;
 
+
 use esp_hal::gpio::{Level, Output, OutputConfig};
+
+// add a display to show instructions
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -103,9 +106,6 @@ impl Relays {
 esp_bootloader_esp_idf::esp_app_desc!();
 const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
 
-const SSID_HOME: &'static str = "Avatel_bVY3";
-const BSSID_HOME: &'static str = "3XDzF9vp";
-
 static AP_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
 static AP_TX_BUFFER : StaticCell<[u8; 1536]>= StaticCell::new();
 static STA_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
@@ -117,8 +117,6 @@ async fn main(spawner: Spawner) {
 
     esp_println::logger::init_logger_from_env();
 
-    // prepare pages (and later relays)
-
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -128,6 +126,8 @@ async fn main(spawner: Spawner) {
     esp_hal_embassy::init(timer0.alarm0);
 
     info!("Embassy initialized!");
+
+
 
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
     let timer1 = TimerGroup::new(peripherals.TIMG0);
@@ -150,10 +150,9 @@ async fn main(spawner: Spawner) {
         gateway: Some(gw_ip_addr),
         dns_servers: Default::default(),
     });
-
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-        // Reading config    
+    // Reading config    
     // cannot use nvs without the safe api
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
  
@@ -161,21 +160,21 @@ async fn main(spawner: Spawner) {
     let client_config = if let Some((ssid, bssid)) = get_wifi_config(&mut flash).await {
         let ssidn =  bytes_to_clean_string(ssid.as_bytes()).unwrap_or(String::new());
         let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
-        info!("WiFi configured! {}:{}", ssidn, bssidn);
+        //info!("WiFi configured! {}:{}", ssidn, bssidn);
         
         start_wifi = true;
-        Configuration::Mixed(
-        //    Configuration::Client(
+        //Configuration::Mixed(
+            Configuration::Client(
             ClientConfiguration {
                 ssid: ssidn.into(),
                 password: bssidn.into(),
                 ..Default::default()
-            },
-            AccessPointConfiguration {
-                ssid: "esp-wifi".into(),
-                ..Default::default()
-            },
-        )
+            })//,
+        //    AccessPointConfiguration {
+        //        ssid: "esp-wifi".into(),
+        //        ..Default::default()
+        //    },
+        //)
     } else {
         info!("Wifi not configured yet, starting only AP");
         Configuration::AccessPoint(
@@ -195,12 +194,13 @@ async fn main(spawner: Spawner) {
     ); 
     
     // TODO refactor this both cases into tasks (didnt work well)
+    // spawner.spawn(run_ap(ap_stack)).unwrap(); // this method fails, invalid AP state
+    // spawner.spawn(run_sta(sta_stack)).unwrap();
     if !start_wifi {
         info!("Spawning ap");
-        spawner.spawn(connection(controller)).ok();
+        spawner.spawn(ap_connection(controller)).ok();
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
-    // spawner.spawn(run_ap(ap_stack)).unwrap(); // this method fails, invalid AP state
     
         let rx_buf = AP_RX_BUFFER.init([0; 1536]);
         let tx_buf = AP_TX_BUFFER.init([0; 1536]);
@@ -290,7 +290,6 @@ async fn main(spawner: Spawner) {
             socket.abort();
         }
     } else {
-        // once again
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
         // and printing: WARN - Unable to allocate 1700 bytes
 
@@ -302,12 +301,8 @@ async fn main(spawner: Spawner) {
             mk_static!(StackResources<4>, StackResources::<4>::new()),
             seed,
         ); 
-
-   
-        spawner.spawn(other_connection(controller)).ok();
-// the order below matters, if sta is after ap, it wont get to connect STA
+        spawner.spawn(sta_connection(controller)).ok();
         spawner.spawn(net_task(sta_runner)).ok();
-        //spawner.spawn(net_task(ap_runner)).ok();
         
         loop {
             if sta_stack.is_link_up() {
@@ -316,16 +311,7 @@ async fn main(spawner: Spawner) {
             info!("STA not connected");
             Timer::after(Duration::from_millis(500)).await;
         }
-       /* 
-        AP doesnt connect ever
-        loop {
-            if ap_stack.is_link_up() {
-                break;
-            }
-            info!("AP not connected");
-            Timer::after(Duration::from_millis(500)).await;
-        }
-        */
+
         let max_connection_attempts = 50;
         let mut attempt = 0;
         let sta_address = loop {
@@ -346,12 +332,7 @@ async fn main(spawner: Spawner) {
         info!("Connected to {}", sta_address);
 
 
-        //        spawner.spawn(run_sta(sta_stack)).unwrap();
 
-        //let rx_buf1 = AP_RX_BUFFER.init([0; 1536]);
-        //let tx_buf1 = AP_TX_BUFFER.init([0; 1536]);
-        //let mut ap_socket = TcpSocket::new(ap_stack, rx_buf1, tx_buf1);
-        //ap_socket.set_timeout(Some(Duration::from_secs(10)));
         let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
         let tx_buf2 = STA_TX_BUFFER.init([0; 1536]);
         let mut socket = TcpSocket::new(sta_stack, rx_buf2, tx_buf2);
@@ -367,34 +348,16 @@ async fn main(spawner: Spawner) {
         const PAGE: &str = include_str!("../html/index.html");
 
         info!("Starts listener");
-        // this below doesnt work
         loop {
-            //let socket = &mut sta_server_socket;
-            let r =
-            //let either_socket = embassy_futures::select::select(
-            //    ap_socket.accept(IpListenEndpoint {
-            //        addr: None,
-            //        port: 8080,
-            //    }),
-                socket.accept(IpListenEndpoint {
+            let r = socket.accept(IpListenEndpoint {
                     addr: None,
                     port: 8080,
                 }
             )
             .await;
-            //let (r, server_socket) = match either_socket {
-            //    Either::First(r) => (r, &mut ap_socket),
-            //    Either::Second(r) => (r, &mut sta_server_socket),
-            //};
             info!("Connected...");
-           /* 
-            if let Err(e) = r {
-            info!("connect error: {:?}", e);
-                continue;
-            }
-            */ 
-            let mut buffer = [0u8; 1024];
-            
+           
+            let mut buffer = [0u8; 1024]; 
             let n = socket.read(&mut buffer).await.unwrap_or(0);
             if n == 0 {
                 // client closed immediately; drop socket and listen again
@@ -518,7 +481,7 @@ async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: S
 
 // another connection example TODO: test it
 #[embassy_executor::task]
-async fn other_connection(mut controller: WifiController<'static>) {
+async fn sta_connection(mut controller: WifiController<'static>) {
     log::info!("start connection task");
     log::info!("Device capabilities: {:?}", controller.capabilities());
     loop {
@@ -557,7 +520,7 @@ async fn other_connection(mut controller: WifiController<'static>) {
     }
 }
 
-
+/* 
 #[embassy_executor::task]
 async fn dual_connection(mut controller: WifiController<'static>) {
     info!("start connection task");
@@ -588,10 +551,10 @@ async fn dual_connection(mut controller: WifiController<'static>) {
         }
     }
 } 
-
+ */
 //this is the fn in the only AP example (https://github.com/esp-rs/esp-hal/blob/esp-hal-v1.0.0-rc.0/examples/src/bin/wifi_embassy_access_point.rs)
 #[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
+async fn ap_connection(mut controller: WifiController<'static>) {
     info!("start connection task");
     info!("Device capabilities: {:?}", controller.capabilities());
     loop {
@@ -698,7 +661,7 @@ fn bytes_to_clean_string(data: &[u8]) -> Option<String> {
 }
 
 
-
+/* 
 #[embassy_executor::task]
 async fn run_ap(stack: Stack<'static>/* , mut flash: FlashStorage */) {
     let rx_buf = AP_RX_BUFFER.init([0; 1536]);
@@ -725,8 +688,9 @@ async fn run_ap(stack: Stack<'static>/* , mut flash: FlashStorage */) {
         }
     }
 }
-
-#[embassy_executor::task]
+ */
+/* 
+ #[embassy_executor::task]
 async fn run_sta(stack: Stack<'static>) {
     let rx_buf = STA_RX_BUFFER.init([0; 1536]);
     let tx_buf = STA_TX_BUFFER.init([0; 1536]);
@@ -754,7 +718,8 @@ async fn run_sta(stack: Stack<'static>) {
         }
     }
 }
-
+ */
+/* 
 /// Common handler
 async fn handle_client(
     socket: &mut TcpSocket<'static>,
@@ -793,6 +758,7 @@ async fn handle_client(
     socket.flush().await.expect("Error flushing response");
     Ok(())
 }
+*/
 async fn send_ok(socket: &mut embassy_net::tcp::TcpSocket<'_>) -> bool {
     let body = "OK";
     let resp = format!(
@@ -803,4 +769,4 @@ async fn send_ok(socket: &mut embassy_net::tcp::TcpSocket<'_>) -> bool {
     let _ = socket.write_all(resp.as_bytes()).await;
     let _ = socket.flush().await;
     true
-}
+} 
