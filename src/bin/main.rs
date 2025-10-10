@@ -46,15 +46,8 @@ use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
 
 // TODO:
-//   display 
-    // refactor usage (in a new task that receives messages via channel)
-    // show instructions
-        // [x] AP ("Find the wifi network xxx and connect to it, then enter 192.168.2.1")
-            // add port: 8080
-        // [x] connecting sta message
-        // [x] STA (display the IP used)
-    // [ ] show status?
-
+    // refactor display usage (in a new task that receives messages via channel)
+    // add time (and use it to fix the time config)? ie: https://github.com/claudiomattera/esp32c3-embassy/blob/master/esp32c3-embassy/src/clock.rs
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
