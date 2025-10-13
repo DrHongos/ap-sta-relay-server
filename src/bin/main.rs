@@ -114,15 +114,11 @@ impl Relays {
 esp_bootloader_esp_idf::esp_app_desc!();
 const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
 
-static AP_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
-static AP_TX_BUFFER : StaticCell<[u8; 1536]>= StaticCell::new();
-static STA_RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
-static STA_TX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
+static RX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
+static TX_BUFFER: StaticCell<[u8; 1536]> = StaticCell::new();
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
-    // generator version: 0.5.0
-
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -136,28 +132,15 @@ async fn main(spawner: Spawner) {
     info!("Embassy initialized!");
 
     // display inclusion
-    let sda = peripherals.GPIO8;   
-    let scl = peripherals.GPIO9;   
     let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
-         .with_sda(sda)
-         .with_scl(scl);
+         .with_sda(peripherals.GPIO8)
+         .with_scl(peripherals.GPIO9);
     
     let interface = I2CDisplayInterface::new(i2c);
     let mut display: Ssd1306<I2CInterface<I2c<'_, esp_hal::Blocking>>, DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>> = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     display.init().unwrap();
-    let style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
     set_text_display(&mut display, "Welcome! instructions are loading..");
-/*         
-    display.clear(BinaryColor::Off).unwrap();
-    Text::new("Hello from Embassy!", Point::new(0, 16), style)
-        .draw(&mut display)
-        .unwrap();
-    display.flush().unwrap(); */
-    // end display test
 
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
     let timer1 = TimerGroup::new(peripherals.TIMG0);
@@ -173,6 +156,7 @@ async fn main(spawner: Spawner) {
     let wifi_ap_device = interfaces.ap;
     let wifi_sta_device = interfaces.sta;
 
+    // what happens if several devices connect simultaneously
     let gw_ip_addr_str = "192.168.2.1";
     let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).unwrap();
     let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
@@ -182,7 +166,6 @@ async fn main(spawner: Spawner) {
     });
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // Reading config    
     // cannot use nvs without the safe api
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
  
@@ -218,26 +201,27 @@ async fn main(spawner: Spawner) {
     };
     controller.set_configuration(&client_config).unwrap();
         
-    let (ap_stack, ap_runner) = embassy_net::new(
-        wifi_ap_device,
-        ap_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
-        seed,
-    ); 
+    let rx_buf = RX_BUFFER.init([0; 1536]);
+    let tx_buf = TX_BUFFER.init([0; 1536]);
+    let mut buffer = [0u8; 1024];
     
-    // TODO refactor this both cases into tasks (didnt work well)
-    // spawner.spawn(run_ap(ap_stack)).unwrap(); // this method fails, invalid AP state
-    // spawner.spawn(run_sta(sta_stack)).unwrap();
+    // html to serve
+    let page = if start_wifi { include_str!("../html/index.html") } else { include_str!("../html/ap_credentials.html") };
+    
+    // refactored this both cases into tasks (didnt work well)
     if !start_wifi {
         info!("Spawning ap");
+        let (ap_stack, ap_runner) = embassy_net::new(
+            wifi_ap_device,
+            ap_config,
+            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            seed,
+        ); 
         set_text_display(&mut display, "Connect to 'esp-wifi', find url 192.168.2.1, to configure your LAN");
-        
         spawner.spawn(ap_connection(controller)).ok();
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
     
-        let rx_buf = AP_RX_BUFFER.init([0; 1536]);
-        let tx_buf = AP_TX_BUFFER.init([0; 1536]);
         let mut socket = TcpSocket::new(ap_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
         loop {
@@ -255,7 +239,6 @@ async fn main(spawner: Spawner) {
                 continue;
             }
     
-            let mut buffer = [0u8; 1024];
             let mut pos = 0;
             loop {
                 match socket.read(&mut buffer).await {
@@ -300,11 +283,10 @@ async fn main(spawner: Spawner) {
                 };
             }
             // prepare response
-            const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
-                CRED_PAGE.len(),
-                CRED_PAGE
+                page.len(),
+                page
             );
             let r = socket.write_all(resp.as_bytes()).await;
     
@@ -326,7 +308,7 @@ async fn main(spawner: Spawner) {
     } else {
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
         // and printing: WARN - Unable to allocate 1700 bytes
-
+        
         set_text_display(&mut display, "Connecting to Wifi");
         let sta_config = embassy_net::Config::dhcpv4(Default::default());
         let (sta_stack, sta_runner) = embassy_net::new(
@@ -346,7 +328,7 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_millis(500)).await;
         }
 
-        let max_connection_attempts = 50;
+        let max_connection_attempts = 40;
         let mut attempt = 0;
         let sta_address = loop {
             if let Some(config) = sta_stack.config_v4() {
@@ -367,12 +349,10 @@ async fn main(spawner: Spawner) {
         let ip_text = format!("Enter {}", sta_address);
         set_text_display(&mut display, &ip_text);
         
-
-        let rx_buf2 = STA_RX_BUFFER.init([0; 1536]);
-        let tx_buf2 = STA_TX_BUFFER.init([0; 1536]);
-        let mut socket = TcpSocket::new(sta_stack, rx_buf2, tx_buf2);
+        let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
+        // app logic
         let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
         let r2 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
         let r3 = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
@@ -380,11 +360,8 @@ async fn main(spawner: Spawner) {
             Relays::new(r1, r2, r3)
         );
 
-        const PAGE: &str = include_str!("../html/index.html");
-
-        info!("Starts listener");
         loop {
-            let r = socket.accept(IpListenEndpoint {
+            let _r = socket.accept(IpListenEndpoint {
                     addr: None,
                     port: 8080,
                 }
@@ -392,21 +369,18 @@ async fn main(spawner: Spawner) {
             .await;
             info!("Connected...");
            
-            let mut buffer = [0u8; 1024]; 
             let n = socket.read(&mut buffer).await.unwrap_or(0);
             if n == 0 {
-                // client closed immediately; drop socket and listen again
                 continue;
             }
             let req = core::str::from_utf8(&buffer[..n]).unwrap_or("");
             let first_line = req.lines().next().unwrap_or("");  // Route by first line, e.g.: "GET /relay1?on HTTP/1.1"
             let mut sent = false;
             if first_line.starts_with("GET / ") {
-                // Serve the page
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
-                    PAGE.len(),
-                    PAGE
+                    page.len(),
+                    page
                 );
                 let _ = socket.write_all(resp.as_bytes()).await;
                 let _ = socket.flush().await;
@@ -426,7 +400,6 @@ async fn main(spawner: Spawner) {
                     if on { relays.on(idx) } else { relays.off(idx) };
                 };
 
-                // Match relay endpoints
                 match first_line {
                     l if l.starts_with("GET /relay1?on")  => { handle(1, true);  sent = send_ok(&mut socket).await; }
                     l if l.starts_with("GET /relay1?off") => { handle(1, false); sent = send_ok(&mut socket).await; }
@@ -533,7 +506,6 @@ async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: S
     ).await.unwrap();   
 }
 
-// another connection example TODO: test it
 #[embassy_executor::task]
 async fn sta_connection(mut controller: WifiController<'static>) {
     log::info!("start connection task");
@@ -574,38 +546,6 @@ async fn sta_connection(mut controller: WifiController<'static>) {
     }
 }
 
-/* 
-#[embassy_executor::task]
-async fn dual_connection(mut controller: WifiController<'static>) {
-    info!("start connection task");
-    info!("Device capabilities: {:?}", controller.capabilities());
-
-    info!("Starting wifi");
-    controller.start_async().await.unwrap();
-    info!("Wifi started!");
-
-    loop {
-        match esp_wifi::wifi::ap_state() {
-            WifiState::ApStarted => {
-                info!("About to connect...");
-
-                match controller.connect_async().await {
-                    Ok(_) => {
-                        // wait until we're no longer connected
-                        controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                        info!("STA disconnected");
-                    }
-                    Err(e) => {
-                        info!("Failed to connect to wifi: {e:?}");
-                        Timer::after(Duration::from_millis(5000)).await
-                    }
-                }
-            }
-            _ => return,
-        }
-    }
-} 
- */
 //this is the fn in the only AP example (https://github.com/esp-rs/esp-hal/blob/esp-hal-v1.0.0-rc.0/examples/src/bin/wifi_embassy_access_point.rs)
 #[embassy_executor::task]
 async fn ap_connection(mut controller: WifiController<'static>) {
@@ -621,11 +561,6 @@ async fn ap_connection(mut controller: WifiController<'static>) {
             _ => {}
         }
         if !matches!(controller.is_started(), Ok(true)) {
-            //let client_config = Configuration::AccessPoint(AccessPointConfiguration {
-            //    ssid: "esp-wifi".try_into().unwrap(),
-            //    ..Default::default()
-            //});
-            //controller.set_configuration(&client_config).unwrap();
             info!("Starting wifi");
             controller.start_async().await.unwrap();
             info!("Wifi started!");
@@ -713,106 +648,6 @@ fn bytes_to_clean_string(data: &[u8]) -> Option<String> {
     let slice = &data[start..end];
     core::str::from_utf8(slice).ok().map(String::from)
 }
-
-
-/* 
-#[embassy_executor::task]
-async fn run_ap(stack: Stack<'static>/* , mut flash: FlashStorage */) {
-    let rx_buf = AP_RX_BUFFER.init([0; 1536]);
-    let tx_buf = AP_TX_BUFFER.init([0; 1536]);
-
-    let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
-    socket.set_timeout(Some(Duration::from_secs(10)));
-
-    loop {
-        info!("AP waiting for connection...");
-        let r = socket.accept(IpListenEndpoint {
-            addr: None,
-            port: 8080,
-        }).await;
-
-        if let Err(e) = r {
-            info!("AP connect error: {:?}", e);
-            continue;
-        }
-        info!("AP client connected");
-
-        if let Err(e) = handle_client(&mut socket, None/* Some(&mut flash) */, true).await {
-            info!("AP client error: {:?}", e);
-        }
-    }
-}
- */
-/* 
- #[embassy_executor::task]
-async fn run_sta(stack: Stack<'static>) {
-    let rx_buf = STA_RX_BUFFER.init([0; 1536]);
-    let tx_buf = STA_TX_BUFFER.init([0; 1536]);
-    let mut sta_socket = TcpSocket::new(
-        stack,
-        rx_buf,
-        tx_buf,
-    );
-    sta_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-    loop {
-        info!("STA waiting for connection...");
-        let r = sta_socket.accept(IpListenEndpoint {
-            addr: None,
-            port: 8080,
-        }).await;
-
-        if let Err(e) = r {
-            info!("STA connect error: {:?}", e);
-            continue;
-        }
-        info!("STA client connected");
-
-        if let Err(e) = handle_client(&mut sta_socket, None, false).await {
-            info!("STA client error: {:?}", e);
-        }
-    }
-}
- */
-/* 
-/// Common handler
-async fn handle_client(
-    socket: &mut TcpSocket<'static>,
-    flash: Option<&mut FlashStorage>,
-    is_ap: bool,
-) -> Result<(), Error> {
-    let mut buffer = [0u8; 1024];
-    let len = socket.read(&mut buffer).await.expect("Error reading socket");
-    if len == 0 {
-        return Ok(());
-    }
-    const PAGE: &str = include_str!("../html/index.html");
-    const CRED_PAGE: &str = include_str!("../html/ap_credentials.html");
-
-    let req = core::str::from_utf8(&buffer[..len]).unwrap_or("");
-    let first_line = req.lines().next().unwrap_or("");
-    info!("Request: {}", first_line);
-
-    if is_ap && first_line.starts_with("POST /save") {
-        if let Some(body) = extract_body(req) {
-            if let Some((ssid, bssid)) = parse_form(body) {
-                //let flash = flash.unwrap();
-                //store_credentials(flash, ssid, bssid).await;
-                esp_hal::system::software_reset();
-            }
-        }
-    }
-
-    let page = if is_ap { CRED_PAGE } else { PAGE };
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-        page.len(),
-        page
-    );
-    socket.write_all(resp.as_bytes()).await.expect("Error writing response");
-    socket.flush().await.expect("Error flushing response");
-    Ok(())
-}
-*/
 async fn send_ok(socket: &mut embassy_net::tcp::TcpSocket<'_>) -> bool {
     let body = "OK";
     let resp = format!(
