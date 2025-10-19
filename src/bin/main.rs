@@ -42,10 +42,12 @@ use embedded_graphics::{
     text::Text,
 };
 
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
 
 // TODO:
+    // add buttons and manage relays dual-mode
+
     // refactor display usage (in a new task that receives messages via channel)
     // add time (and use it to fix the time config)? ie: https://github.com/claudiomattera/esp32c3-embassy/blob/master/esp32c3-embassy/src/clock.rs
 
@@ -200,14 +202,22 @@ async fn main(spawner: Spawner) {
         )
     };
     controller.set_configuration(&client_config).unwrap();
-        
+
+// test: buttons for dual-mode
+    // then, move relay control to a message channel control
+    //let led = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default()); // USED.. 
+    let b1_on = Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
+    let b1_off = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
+    spawner.spawn(manual_buttons(b1_on, b1_off)).unwrap();
+
+
     let rx_buf = RX_BUFFER.init([0; 1536]);
     let tx_buf = TX_BUFFER.init([0; 1536]);
     let mut buffer = [0u8; 1024];
     
     // html to serve
     let page = if start_wifi { include_str!("../html/index.html") } else { include_str!("../html/ap_credentials.html") };
-    
+        
     // refactored this both cases into tasks (didnt work well)
     if !start_wifi {
         info!("Spawning ap");
@@ -427,6 +437,38 @@ async fn main(spawner: Spawner) {
         }
     
     }
+}
+
+#[embassy_executor::task]
+async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
+    // when button is pressed, print a message
+    loop  {
+        if b1_on.level() == Level::Low {
+            info!("🔵 ON button pressed!");
+            // Wait for release to avoid multiple triggers
+            while b1_on.level() == Level::Low {
+                Timer::after(Duration::from_millis(10)).await;
+            }
+            Timer::after(Duration::from_millis(100)).await; // debounce
+        }
+
+        // Check OFF button
+        if b1_off.level() == Level::Low {
+            info!("🔴 OFF button pressed!");
+            // Wait for release
+            while b1_off.level() == Level::Low {
+                Timer::after(Duration::from_millis(10)).await;
+            }
+            Timer::after(Duration::from_millis(100)).await;
+        }
+
+        // Yield briefly
+        Timer::after(Duration::from_millis(10)).await;
+    
+
+
+    }
+
 }
 
 #[embassy_executor::task]
