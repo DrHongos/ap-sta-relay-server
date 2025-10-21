@@ -42,8 +42,12 @@ use embedded_graphics::{
     text::Text,
 };
 
-use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
+
+use embassy_sync::channel::Channel;
+use  embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 // TODO:
     // add buttons and manage relays dual-mode
@@ -67,38 +71,36 @@ macro_rules! mk_static {
     }};
 }
 
+static CHANNEL: Channel<CriticalSectionRawMutex, (u8, bool), 8> = Channel::new();
+
+
 static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
-pub struct Relays {
-    pub r1: Output<'static>,
-    pub r2: Output<'static>,
-    pub r3: Output<'static>,
+
+#[derive(Clone, Copy)]
+pub struct RelayState {
     pub s1: bool,
     pub s2: bool,
     pub s3: bool,
 }
-impl Relays {
-    fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
-        Self { r1, r2, r3, s1: false, s2: false, s3: false }
-    }
-
+impl RelayState {
     fn on(&mut self, idx: u8) {
         match idx {
-            1 => { self.r1.set_high(); self.s1 = true; }
-            2 => { self.r2.set_high(); self.s2 = true; }
-            3 => { self.r3.set_high(); self.s3 = true; }
+            1 => { self.s1 = true; }
+            2 => { self.s2 = true; }
+            3 => { self.s3 = true; }
             _ => {}
         }
     }
 
     fn off(&mut self, idx: u8) {
         match idx {
-            1 => { self.r1.set_low(); self.s1 = false; }
-            2 => { self.r2.set_low(); self.s2 = false; }
-            3 => { self.r3.set_low(); self.s3 = false; }
+            1 => { self.s1 = false; }
+            2 => { self.s2 = false; }
+            3 => { self.s3 = false; }
             _ => {}
         }
     }
-
+    // TODO: need to use this in different threads
     fn json_status(&self) -> heapless::String<128> {
         // use heapless string since no_std
         let mut s = heapless::String::<128>::new();
@@ -109,6 +111,43 @@ impl Relays {
             self.s1, self.s2, self.s3
         );
         s
+    }
+}
+
+static STATE: Mutex<CriticalSectionRawMutex, RelayState> = Mutex::new(RelayState {
+    s1: false,
+    s2: false,
+    s3: false
+});
+
+// TODO: separate state from hardware
+pub struct Relays {
+    pub r1: Output<'static>,
+    pub r2: Output<'static>,
+    pub r3: Output<'static>,
+}
+// TODO: fix this
+impl Relays {
+    fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
+        Self { r1, r2, r3  }
+    }
+
+    fn on(&mut self, idx: u8) {
+        match idx {
+            1 => { self.r1.set_high(); }
+            2 => { self.r2.set_high(); }
+            3 => { self.r3.set_high(); }
+            _ => {}
+        }
+    }
+
+    fn off(&mut self, idx: u8) {
+        match idx {
+            1 => { self.r1.set_low(); }
+            2 => { self.r2.set_low(); }
+            3 => { self.r3.set_low(); }
+            _ => {}
+        }
     }
 }
 
@@ -203,12 +242,24 @@ async fn main(spawner: Spawner) {
     };
     controller.set_configuration(&client_config).unwrap();
 
+    // app logic
+    let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+    let r2 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
+    let r3 = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    let mut relays: &'static mut Relays = RELAYS_CELL.init(
+        Relays::new(r1, r2, r3)
+    );
+    //let relay_state: Mutex<CriticalSectionRawMutex, RelayState> = Mutex::new(RelayState::new());
+    
+    spawner.spawn(handle_relays(relays)).unwrap();
+
 // test: buttons for dual-mode
     // then, move relay control to a message channel control
-    //let led = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default()); // USED.. 
+    // TODO: create struct for buttons
     let b1_on = Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     let b1_off = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
-    spawner.spawn(manual_buttons(b1_on, b1_off)).unwrap();
+    // TODO: add more buttons
+    spawner.spawn(manual_buttons(b1_on, b1_off)).unwrap(); 
 
 
     let rx_buf = RX_BUFFER.init([0; 1536]);
@@ -362,13 +413,6 @@ async fn main(spawner: Spawner) {
         let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
-        // app logic
-        let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
-        let r2 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
-        let r3 = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
-        let relays: &'static mut Relays = RELAYS_CELL.init(
-            Relays::new(r1, r2, r3)
-        );
 
         loop {
             let _r = socket.accept(IpListenEndpoint {
@@ -396,7 +440,8 @@ async fn main(spawner: Spawner) {
                 let _ = socket.flush().await;
                 sent = true;
             } else if first_line.starts_with("GET /status") {
-                let body = relays.json_status();
+                let state = STATE.lock().await;
+                let body = state.json_status();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
                     body.len(),
@@ -405,18 +450,16 @@ async fn main(spawner: Spawner) {
                 let _ = socket.write_all(resp.as_bytes()).await;
                 let _ = socket.flush().await;
                 sent = true;
+            
+                info!("TODO: status");
             } else {
-                let mut handle = |idx: u8, on: bool| {
-                    if on { relays.on(idx) } else { relays.off(idx) };
-                };
-
                 match first_line {
-                    l if l.starts_with("GET /relay1?on")  => { handle(1, true);  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay1?off") => { handle(1, false); sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay2?on")  => { handle(2, true);  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay2?off") => { handle(2, false); sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay3?on")  => { handle(3, true);  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay3?off") => { handle(3, false); sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay1?on")  => { CHANNEL.send((1, true)).await;  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay1?off") => { CHANNEL.send((1, false)).await; sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay2?on")  => { CHANNEL.send((2, true)).await;  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay2?off") => { CHANNEL.send((2, false)).await; sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay3?on")  => { CHANNEL.send((3, true)).await;  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay3?off") => { CHANNEL.send((3, false)).await; sent = send_ok(&mut socket).await; }
                     _ => {}
                 }
             }
@@ -440,6 +483,23 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
+async fn handle_relays(mut relays: &'static mut Relays) {
+
+    let mut handle = async |idx: u8, on: bool| {
+        if on { relays.on(idx) } else { relays.off(idx) };
+        let mut state = STATE.lock().await;
+        if on { state.on(idx) } else { state.off(idx) };
+    };
+
+    // receive messages and operate on relays    
+    loop {
+        let (num, flag) = CHANNEL.receive().await;
+        handle(num, flag).await;
+    }
+
+}
+
+#[embassy_executor::task]
 async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
     // when button is pressed, print a message
     loop  {
@@ -449,6 +509,8 @@ async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
             while b1_on.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             }
+            //relays.on(1);
+            CHANNEL.send((1, true)).await;
             Timer::after(Duration::from_millis(100)).await; // debounce
         }
 
@@ -458,7 +520,9 @@ async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
             // Wait for release
             while b1_off.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
-            }
+            } 
+            //relays.off(1);
+            CHANNEL.send((1, false)).await;
             Timer::after(Duration::from_millis(100)).await;
         }
 
