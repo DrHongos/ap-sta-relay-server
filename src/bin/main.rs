@@ -278,7 +278,7 @@ async fn main(spawner: Spawner) {
             mk_static!(StackResources<3>, StackResources::<3>::new()),
             seed,
         ); 
-        set_text_display(&mut display, "Connect to 'esp-wifi', find url 192.168.2.1, to configure your LAN");
+        set_text_display(&mut display, "Connect to 'esp-wifi', open 192.168.2.1:8080, to configure your LAN");
         spawner.spawn(ap_connection(controller)).ok();
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
@@ -407,7 +407,7 @@ async fn main(spawner: Spawner) {
             }
         };
         info!("Connected to {}", sta_address);
-        let ip_text = format!("Enter {}", sta_address);
+        let ip_text = format!("Go to , {}:8080", sta_address);
         set_text_display(&mut display, &ip_text);
         
         let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
