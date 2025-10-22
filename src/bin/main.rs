@@ -246,7 +246,7 @@ async fn main(spawner: Spawner) {
     let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
     let r2 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
     let r3 = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
-    let mut relays: &'static mut Relays = RELAYS_CELL.init(
+    let relays: &'static mut Relays = RELAYS_CELL.init(
         Relays::new(r1, r2, r3)
     );
     //let relay_state: Mutex<CriticalSectionRawMutex, RelayState> = Mutex::new(RelayState::new());
@@ -483,7 +483,7 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn handle_relays(mut relays: &'static mut Relays) {
+async fn handle_relays(relays: &'static mut Relays) {
 
     let mut handle = async |idx: u8, on: bool| {
         if on { relays.on(idx) } else { relays.off(idx) };
