@@ -49,11 +49,6 @@ use embassy_sync::channel::Channel;
 use  embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
-// TODO:
-    // add buttons and manage relays dual-mode
-
-    // refactor display usage (in a new task that receives messages via channel)
-    // add time (and use it to fix the time config)? ie: https://github.com/claudiomattera/esp32c3-embassy/blob/master/esp32c3-embassy/src/clock.rs
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -100,7 +95,6 @@ impl RelayState {
             _ => {}
         }
     }
-    // TODO: need to use this in different threads
     fn json_status(&self) -> heapless::String<128> {
         // use heapless string since no_std
         let mut s = heapless::String::<128>::new();
@@ -120,13 +114,11 @@ static STATE: Mutex<CriticalSectionRawMutex, RelayState> = Mutex::new(RelayState
     s3: false
 });
 
-// TODO: separate state from hardware
 pub struct Relays {
     pub r1: Output<'static>,
     pub r2: Output<'static>,
     pub r3: Output<'static>,
 }
-// TODO: fix this
 impl Relays {
     fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
         Self { r1, r2, r3  }
@@ -197,7 +189,6 @@ async fn main(spawner: Spawner) {
     let wifi_ap_device = interfaces.ap;
     let wifi_sta_device = interfaces.sta;
 
-    // what happens if several devices connect simultaneously
     let gw_ip_addr_str = "192.168.2.1";
     let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).unwrap();
     let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
@@ -214,22 +205,15 @@ async fn main(spawner: Spawner) {
     let client_config = if let Some((ssid, bssid)) = get_wifi_config(&mut flash).await {
         let ssidn =  bytes_to_clean_string(ssid.as_bytes()).unwrap_or(String::new());
         let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
-        //info!("WiFi configured! {}:{}", ssidn, bssidn);
         
         set_text_display(&mut display, "Wifi is configured");
         start_wifi = true;
-        //Configuration::Mixed(
             Configuration::Client(
             ClientConfiguration {
                 ssid: ssidn.into(),
                 password: bssidn.into(),
                 ..Default::default()
-            })//,
-        //    AccessPointConfiguration {
-        //        ssid: "esp-wifi".into(),
-        //        ..Default::default()
-        //    },
-        //)
+            })
     } else {
         info!("Wifi not configured yet, starting only AP");
         set_text_display(&mut display, "Wifi is not configured");
@@ -249,16 +233,13 @@ async fn main(spawner: Spawner) {
     let relays: &'static mut Relays = RELAYS_CELL.init(
         Relays::new(r1, r2, r3)
     );
-    //let relay_state: Mutex<CriticalSectionRawMutex, RelayState> = Mutex::new(RelayState::new());
     
     spawner.spawn(handle_relays(relays)).unwrap();
 
-// test: buttons for dual-mode
-    // then, move relay control to a message channel control
     // TODO: create struct for buttons
+    // TODO: add more buttons
     let b1_on = Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     let b1_off = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
-    // TODO: add more buttons
     spawner.spawn(manual_buttons(b1_on, b1_off)).unwrap(); 
 
 
@@ -308,16 +289,9 @@ async fn main(spawner: Spawner) {
                         break;
                     }
                     Ok(len) => {
-                        let to_print =
-                            unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-    
-                        // maybe here i need to filter different requests?
-                        info!("to_print: {}", to_print);
+                        let to_print = unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
                         let first_line = to_print.lines().next().unwrap_or("");
-                        info!("first_line: {}", first_line);
-    
                         if first_line.starts_with("POST /save HTTP/1.1") {
-                            // parse and store
                             info!("Received {}", first_line);
                             if let Some(body) = extract_body(to_print) {
                                 if let Some((ssid, bssid)) = parse_form(body) {
@@ -332,9 +306,6 @@ async fn main(spawner: Spawner) {
                             info!("{}", to_print);
                             break;
                         }
-    
-    
-    
                         pos += len;
                     }
                     Err(e) => {
@@ -363,13 +334,11 @@ async fn main(spawner: Spawner) {
     
             socket.close();
             Timer::after(Duration::from_millis(1000)).await;
-    
             socket.abort();
         }
     } else {
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
         // and printing: WARN - Unable to allocate 1700 bytes
-        
         set_text_display(&mut display, "Connecting to Wifi");
         let sta_config = embassy_net::Config::dhcpv4(Default::default());
         let (sta_stack, sta_runner) = embassy_net::new(
@@ -413,7 +382,6 @@ async fn main(spawner: Spawner) {
         let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
-
         loop {
             let _r = socket.accept(IpListenEndpoint {
                     addr: None,
@@ -451,7 +419,6 @@ async fn main(spawner: Spawner) {
                 let _ = socket.flush().await;
                 sent = true;
             
-                info!("TODO: status");
             } else {
                 match first_line {
                     l if l.starts_with("GET /relay1?on")  => { CHANNEL.send((1, true)).await;  sent = send_ok(&mut socket).await; }
@@ -478,7 +445,6 @@ async fn main(spawner: Spawner) {
                         
             log::info!("Response sent, closing socket");
         }
-    
     }
 }
 
@@ -490,8 +456,6 @@ async fn handle_relays(relays: &'static mut Relays) {
         let mut state = STATE.lock().await;
         if on { state.on(idx) } else { state.off(idx) };
     };
-
-    // receive messages and operate on relays    
     loop {
         let (num, flag) = CHANNEL.receive().await;
         handle(num, flag).await;
@@ -501,38 +465,26 @@ async fn handle_relays(relays: &'static mut Relays) {
 
 #[embassy_executor::task]
 async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
-    // when button is pressed, print a message
     loop  {
         if b1_on.level() == Level::Low {
             info!("🔵 ON button pressed!");
-            // Wait for release to avoid multiple triggers
             while b1_on.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             }
-            //relays.on(1);
             CHANNEL.send((1, true)).await;
             Timer::after(Duration::from_millis(100)).await; // debounce
         }
 
-        // Check OFF button
         if b1_off.level() == Level::Low {
             info!("🔴 OFF button pressed!");
-            // Wait for release
             while b1_off.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             } 
-            //relays.off(1);
             CHANNEL.send((1, false)).await;
             Timer::after(Duration::from_millis(100)).await;
         }
-
-        // Yield briefly
         Timer::after(Duration::from_millis(10)).await;
-    
-
-
     }
-
 }
 
 #[embassy_executor::task]
@@ -614,12 +566,9 @@ async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: S
 
 #[embassy_executor::task]
 async fn sta_connection(mut controller: WifiController<'static>) {
-    log::info!("start connection task");
-    log::info!("Device capabilities: {:?}", controller.capabilities());
     loop {
         match esp_wifi::wifi::wifi_state() {
             WifiState::StaConnected => {
-                // wait until we're no longer connected
                 controller.wait_for_event(WifiEvent::StaDisconnected).await;
                 Timer::after(Duration::from_millis(5000)).await
             }
@@ -718,8 +667,6 @@ fn extract_body(request: &str) -> Option<&str> {
     request.split("\r\n\r\n").nth(1)
 }
 
-/// Parses URL-encoded form body into key-value pairs.
-/// Very naive (does not handle %xx decoding).
 fn parse_form(body: &str) -> Option<(String, String)> {
     let mut ssid = "";
     let mut bssid= "";
@@ -734,7 +681,6 @@ fn parse_form(body: &str) -> Option<(String, String)> {
             bssid = val;
         }
         index += 1;
-        //return Some((String::from(key), String::from(val)))
     }
     Some((ssid.to_string(), bssid.to_string()))
 }
