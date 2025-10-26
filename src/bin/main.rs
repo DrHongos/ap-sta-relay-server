@@ -208,7 +208,7 @@ async fn main(spawner: Spawner) {
         
         set_text_display(&mut display, "Wifi is configured");
         start_wifi = true;
-            Configuration::Client(
+        Configuration::Client(
             ClientConfiguration {
                 ssid: ssidn.into(),
                 password: bssidn.into(),
@@ -238,9 +238,10 @@ async fn main(spawner: Spawner) {
 
     // TODO: create struct for buttons
     // TODO: add more buttons
-    let b1_on = Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
-    let b1_off = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
-    spawner.spawn(manual_buttons(b1_on, b1_off)).unwrap(); 
+    let b1= Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
+    let b2 = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
+    let b3 = Input::new(peripherals.GPIO4, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
+    spawner.spawn(manual_buttons(b1, b2, b3)).unwrap(); 
 
 
     let rx_buf = RX_BUFFER.init([0; 1536]);
@@ -420,6 +421,7 @@ async fn main(spawner: Spawner) {
                 sent = true;
             
             } else {
+                // TODO: what to do with flags? 
                 match first_line {
                     l if l.starts_with("GET /relay1?on")  => { CHANNEL.send((1, true)).await;  sent = send_ok(&mut socket).await; }
                     l if l.starts_with("GET /relay1?off") => { CHANNEL.send((1, false)).await; sent = send_ok(&mut socket).await; }
@@ -448,13 +450,26 @@ async fn main(spawner: Spawner) {
     }
 }
 
+// TODO: what to do with the flag (specially for the web interface)
 #[embassy_executor::task]
 async fn handle_relays(relays: &'static mut Relays) {
-
-    let mut handle = async |idx: u8, on: bool| {
-        if on { relays.on(idx) } else { relays.off(idx) };
+    let mut handle = async |idx: u8, _on: bool| {
         let mut state = STATE.lock().await;
-        if on { state.on(idx) } else { state.off(idx) };
+        match idx {
+            1 => {
+                relays.r1.toggle();
+                state.s1 = !state.s1;
+            },
+            2 => {
+                relays.r2.toggle();
+                state.s2 = !state.s2;
+            },
+            3 => {
+                relays.r3.toggle();
+                state.s3 = !state.s3;
+            },
+            _ => {}
+        }
     };
     loop {
         let (num, flag) = CHANNEL.receive().await;
@@ -464,23 +479,30 @@ async fn handle_relays(relays: &'static mut Relays) {
 }
 
 #[embassy_executor::task]
-async fn manual_buttons(b1_on: Input<'static>, b1_off: Input<'static>) {
+async fn manual_buttons(b1: Input<'static>, b2: Input<'static>, b3: Input<'static>) {
     loop  {
-        if b1_on.level() == Level::Low {
-            info!("🔵 ON button pressed!");
-            while b1_on.level() == Level::Low {
+        if b1.level() == Level::Low {
+            info!("R1 button pressed!");
+            while b1.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             }
             CHANNEL.send((1, true)).await;
             Timer::after(Duration::from_millis(100)).await; // debounce
         }
-
-        if b1_off.level() == Level::Low {
-            info!("🔴 OFF button pressed!");
-            while b1_off.level() == Level::Low {
+        if b2.level() == Level::Low {
+            info!("R2 button pressed!");
+            while b2.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             } 
-            CHANNEL.send((1, false)).await;
+            CHANNEL.send((2, false)).await;
+            Timer::after(Duration::from_millis(100)).await;
+        }
+        if b3.level() == Level::Low {
+            info!("R3 button pressed!");
+            while b3.level() == Level::Low {
+                Timer::after(Duration::from_millis(10)).await;
+            } 
+            CHANNEL.send((3, false)).await;
             Timer::after(Duration::from_millis(100)).await;
         }
         Timer::after(Duration::from_millis(10)).await;
