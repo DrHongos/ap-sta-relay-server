@@ -5,7 +5,7 @@
   <title>ESP32 Relay Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-   :root { 
+    :root { 
       --bg:#0f172a; 
       --card:#111827; 
       --text:#e5e7eb; 
@@ -25,24 +25,33 @@
       border:1px solid rgba(255,255,255,.06);
     }
     h1{margin:0 0 6px;font-size:22px;letter-spacing:.2px}
-    .grid{
-      display:grid; grid-template-columns: repeat(1, 1fr); gap:12px;
-    }
+    .grid{display:grid;grid-template-columns:repeat(1,1fr);gap:12px;}
     .cell{
-      background:rgba(255,255,255,.02); padding:14px; border-radius:14px; border:1px solid rgba(255,255,255,.05)
+      background:rgba(255,255,255,.02);padding:14px;border-radius:14px;border:1px solid rgba(255,255,255,.05)
     }
     .name{font-size:14px;margin:0 0 10px;color:#cbd5e1;display:flex;justify-content:space-between;align-items:center}
 
-    /* Slider toggle with glow */
+    /* Slider toggle with dual-color glow and pulse */
+    @keyframes pulseOn {
+      0% { box-shadow: 0 0 10px rgba(96,165,250,.6), 0 0 30px rgba(96,165,250,.3); }
+      50% { box-shadow: 0 0 20px rgba(96,165,250,.9), 0 0 45px rgba(96,165,250,.4); }
+      100% { box-shadow: 0 0 10px rgba(96,165,250,.6), 0 0 30px rgba(96,165,250,.3); }
+    }
+    @keyframes pulseOff {
+      0% { box-shadow: 0 0 8px rgba(248,113,113,.5), 0 0 18px rgba(248,113,113,.2); }
+      50% { box-shadow: 0 0 14px rgba(248,113,113,.7), 0 0 30px rgba(248,113,113,.3); }
+      100% { box-shadow: 0 0 8px rgba(248,113,113,.5), 0 0 18px rgba(248,113,113,.2); }
+    }
+
     .switch {
       position: relative;
       width: 70px;
       height: 36px;
       background: var(--danger);
       border-radius: 40px;
-      transition: background 0.3s ease, box-shadow 0.3s ease;
+      transition: background 0.3s ease;
       cursor: pointer;
-      box-shadow: inset 0 2px 6px rgba(0,0,0,.4);
+      animation: pulseOff 2.5s infinite;
     }
     .switch::before {
       content: "";
@@ -58,9 +67,7 @@
     }
     .switch.on {
       background: var(--accent);
-      box-shadow: 0 0 10px rgba(96,165,250,.6),
-                  0 0 30px rgba(96,165,250,.3),
-                  inset 0 2px 6px rgba(0,0,0,.4);
+      animation: pulseOn 2.5s infinite;
     }
     .switch.on::before {
       transform: translateX(34px);
@@ -74,9 +81,7 @@
       margin-top: 6px;
       letter-spacing:.3px;
     }
-
-    .footer{margin-top:14px; font-size:12px; color:var(--muted); text-align:right}
- 
+    .footer{margin-top:14px;font-size:12px;color:var(--muted);text-align:right}
   </style>
 
   <script>
@@ -87,7 +92,7 @@
       } catch (e) {
         alert("Request failed: " + e.message);
       }
-      updateUI(); // refresh state
+      updateUI();
     }
 
     async function updateUI() {
@@ -112,13 +117,13 @@
 
     function toggleRelay(num) {
       const sw = document.getElementById("relay"+num);
-      const isOn = sw.classList.contains("on");
-      send(`/relay${num}?${isOn ? "off" : "on"}`);
+      //const isOn = sw.classList.contains("on");
+      send(`/relay${num}`);
     }
 
     window.onload = () => { 
       updateUI(); 
-      setInterval(updateUI, 1000); 
+      setInterval(updateUI, 3000); 
     };
   </script>
 </head>

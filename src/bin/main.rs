@@ -7,6 +7,8 @@
 )]
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_time::{Duration, Timer};
 use embedded_storage_async::nor_flash::NorFlash;
 use esp_hal::clock::CpuClock;
@@ -15,9 +17,12 @@ use esp_hal::timer::timg::TimerGroup;
 use log::info;
 use alloc::string::{String, ToString};
 use alloc::format;
+use rust_mqtt::client::client::MqttClient;
+use rust_mqtt::client::client_config::ClientConfig;
+use rust_mqtt::utils::rng_generator::CountingRng;
 
 use core::net::Ipv4Addr;
-use core::str::FromStr;
+use core::str::{FromStr, from_utf8};
 use esp_storage::FlashStorage;
 use sequential_storage::cache::NoCache;
 use embassy_net::{
@@ -49,6 +54,7 @@ use embassy_sync::channel::Channel;
 use  embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
+use embedded_nal_async::TcpConnect;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -66,8 +72,10 @@ macro_rules! mk_static {
     }};
 }
 
-static CHANNEL: Channel<CriticalSectionRawMutex, (u8, bool), 8> = Channel::new();
-
+static CHANNEL: Channel<CriticalSectionRawMutex, u8, 8> = Channel::new();
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (String, String), 5> = Channel::new(); // TODO: Message type (topic, message) ??
+// TODO: this should be configurable and on NVS
+const TOPIC: &str = "ap-sta-relay-server";
 
 static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
 
@@ -78,6 +86,7 @@ pub struct RelayState {
     pub s3: bool,
 }
 impl RelayState {
+    /* 
     fn on(&mut self, idx: u8) {
         match idx {
             1 => { self.s1 = true; }
@@ -94,7 +103,8 @@ impl RelayState {
             3 => { self.s3 = false; }
             _ => {}
         }
-    }
+    } 
+    */
     fn json_status(&self) -> heapless::String<128> {
         // use heapless string since no_std
         let mut s = heapless::String::<128>::new();
@@ -123,7 +133,7 @@ impl Relays {
     fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
         Self { r1, r2, r3  }
     }
-
+/* 
     fn on(&mut self, idx: u8) {
         match idx {
             1 => { self.r1.set_high(); }
@@ -141,6 +151,7 @@ impl Relays {
             _ => {}
         }
     }
+ */
 }
 
 
@@ -350,7 +361,6 @@ async fn main(spawner: Spawner) {
         ); 
         spawner.spawn(sta_connection(controller)).ok();
         spawner.spawn(net_task(sta_runner)).ok();
-        
         loop {
             if sta_stack.is_link_up() {
                 break;
@@ -379,7 +389,10 @@ async fn main(spawner: Spawner) {
         info!("Connected to {}", sta_address);
         let ip_text = format!("Go to , {}:8080", sta_address);
         set_text_display(&mut display, &ip_text);
-        
+
+        let sta_stack_static = mk_static!(Stack, sta_stack.clone());
+        spawner.spawn(mqtt_task(&*sta_stack_static)).unwrap();
+
         let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
@@ -423,12 +436,9 @@ async fn main(spawner: Spawner) {
             } else {
                 // TODO: what to do with flags? 
                 match first_line {
-                    l if l.starts_with("GET /relay1?on")  => { CHANNEL.send((1, true)).await;  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay1?off") => { CHANNEL.send((1, false)).await; sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay2?on")  => { CHANNEL.send((2, true)).await;  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay2?off") => { CHANNEL.send((2, false)).await; sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay3?on")  => { CHANNEL.send((3, true)).await;  sent = send_ok(&mut socket).await; }
-                    l if l.starts_with("GET /relay3?off") => { CHANNEL.send((3, false)).await; sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay1")  => { CHANNEL.send(1).await;  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay2")  => { CHANNEL.send(2).await;  sent = send_ok(&mut socket).await; }
+                    l if l.starts_with("GET /relay3")  => { CHANNEL.send(3).await;  sent = send_ok(&mut socket).await; }
                     _ => {}
                 }
             }
@@ -450,32 +460,132 @@ async fn main(spawner: Spawner) {
     }
 }
 
-// TODO: what to do with the flag (specially for the web interface)
+// TODO: handle mqtt messaging better
+// maybe the json_status for each button in the loop directly?
 #[embassy_executor::task]
 async fn handle_relays(relays: &'static mut Relays) {
-    let mut handle = async |idx: u8, _on: bool| {
+    let mut handle = async |idx: u8| {
         let mut state = STATE.lock().await;
         match idx {
             1 => {
                 relays.r1.toggle();
                 state.s1 = !state.s1;
+                let m = if state.s1 == true { "relay1: ON" } else { "relay1: OFF" };
+                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             2 => {
                 relays.r2.toggle();
                 state.s2 = !state.s2;
+                let m = if state.s2 == true { "relay2: ON" } else { "relay2: OFF" };
+                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             3 => {
                 relays.r3.toggle();
                 state.s3 = !state.s3;
+                let m = if state.s3 == true { "relay3: ON" } else { "relay3: OFF" };
+                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             _ => {}
         }
     };
     loop {
-        let (num, flag) = CHANNEL.receive().await;
-        handle(num, flag).await;
+        let num = CHANNEL.receive().await;
+        handle(num).await;
     }
 
+}
+
+
+// make the mqtt client configurable (endpoint, topics, etc) on NVS
+// create the first message (discovery retain=true) for a broker indexing
+// create a config web page for the mqtt client & settings
+// topics: set & state for each relay -> name/r1|2|3/set|state (set name on config?)
+#[embassy_executor::task]
+async fn mqtt_task(stack: &'static Stack<'static>) {
+    info!("Start mqtt task");
+    const MQTT_BUFFER_SIZE: usize = 1024;
+    let mut mqtt_buf = [0; MQTT_BUFFER_SIZE];
+    let mut recv_buffer = [0u8; MQTT_BUFFER_SIZE];
+    loop {
+        if !stack.is_link_up() {
+            Timer::after(Duration::from_secs(1)).await;
+            continue;
+        }
+        let mqtt_config: ClientConfig<'_, 5, CountingRng> = ClientConfig::new(
+            rust_mqtt::client::client_config::MqttVersion::MQTTv5, 
+            CountingRng(124356)         // TODO: use a real random
+        ); 
+        let addr = core::net::SocketAddr::new(Ipv4Addr::new(192, 168, 18, 9).into(), 1883);
+        
+        let mut tcp_state: TcpClientState<3, MQTT_BUFFER_SIZE, MQTT_BUFFER_SIZE> = TcpClientState::new();
+        let tcp_client = TcpClient::new(*stack, &mut tcp_state);
+        let tcp_connection = tcp_client.connect(addr).await.unwrap();
+        // create a mqtt client
+        let mut mqtt_client = MqttClient::new(
+            tcp_connection, 
+            &mut mqtt_buf, 
+            MQTT_BUFFER_SIZE, 
+            &mut recv_buffer, 
+            MQTT_BUFFER_SIZE, 
+            mqtt_config
+        );
+        // connect to a broker
+        mqtt_client.connect_to_broker().await.unwrap();
+        
+        // TODO send discovery message
+        
+        // subscribe to command topics
+        info!("Subscribing");
+        let mut topic_set = String::new();
+        topic_set.push_str(TOPIC);
+        topic_set.push_str("/set");
+        //mqtt_client.subscribe_to_topic(&topic_set).await.unwrap();
+
+        // start client loop
+        info!("Starting mqtt messages");
+        loop {
+            match select(
+                MQTT_CHANNEL.receive(),
+                mqtt_client.receive_message()
+            ).await {
+                Either::First((topic, payload)) => {
+                    mqtt_client.send_message(
+                        &topic, 
+                        payload.as_bytes(), 
+                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1, 
+                    false
+                    ).await.unwrap();
+                },
+                Either::Second(res) => {
+                    info!("Received: {:?}", res);
+                    // TOFIX: this code below seems to break everything (actually from wifi connection)
+                    
+                    match res {
+                        Ok((topic, payload)) => {
+                            // filter topic for SET commands
+                            // ignore others
+                            //if let Some((prefix, command)) = topic.rsplit_once("/") {
+                            //    match command {
+                            //        "set" => {
+                            // get relay to toggle on the payload
+                            // and send command through CHANNEL
+                                let relay_idx = u8::from_str_radix(
+                                    from_utf8(payload).unwrap(), 
+                                    10).unwrap_or(0);   // TODO: default case is noop 
+                                CHANNEL.send(relay_idx).await;
+                                //    };
+                            //        "state" => {info!("TODO: get states")},
+                            //        _ => break
+                            //    }
+                            //}
+                        },
+                        Err(_) => break,
+                    }
+                    
+                }
+            }
+        }    
+    }
 }
 
 #[embassy_executor::task]
@@ -486,7 +596,7 @@ async fn manual_buttons(b1: Input<'static>, b2: Input<'static>, b3: Input<'stati
             while b1.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             }
-            CHANNEL.send((1, true)).await;
+            CHANNEL.send(1).await;
             Timer::after(Duration::from_millis(100)).await; // debounce
         }
         if b2.level() == Level::Low {
@@ -494,7 +604,7 @@ async fn manual_buttons(b1: Input<'static>, b2: Input<'static>, b3: Input<'stati
             while b2.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             } 
-            CHANNEL.send((2, false)).await;
+            CHANNEL.send(2).await;
             Timer::after(Duration::from_millis(100)).await;
         }
         if b3.level() == Level::Low {
@@ -502,7 +612,7 @@ async fn manual_buttons(b1: Input<'static>, b2: Input<'static>, b3: Input<'stati
             while b3.level() == Level::Low {
                 Timer::after(Duration::from_millis(10)).await;
             } 
-            CHANNEL.send((3, false)).await;
+            CHANNEL.send(3).await;
             Timer::after(Duration::from_millis(100)).await;
         }
         Timer::after(Duration::from_millis(10)).await;
