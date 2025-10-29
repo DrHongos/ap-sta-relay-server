@@ -8,6 +8,7 @@
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
+use embassy_net::DhcpConfig;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_time::{Duration, Timer};
 use embedded_storage_async::nor_flash::NorFlash;
@@ -51,7 +52,7 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
 
 use embassy_sync::channel::Channel;
-use  embassy_sync::mutex::Mutex;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use embedded_nal_async::TcpConnect;
@@ -73,8 +74,9 @@ macro_rules! mk_static {
 }
 
 static CHANNEL: Channel<CriticalSectionRawMutex, u8, 8> = Channel::new();
-static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (String, String), 5> = Channel::new(); // TODO: Message type (topic, message) ??
+
 // TODO: this should be configurable and on NVS
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (String, String), 5> = Channel::new(); // TODO: Message type (topic, message) ??
 const TOPIC: &str = "ap-sta-relay-server";
 
 static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
@@ -86,25 +88,6 @@ pub struct RelayState {
     pub s3: bool,
 }
 impl RelayState {
-    /* 
-    fn on(&mut self, idx: u8) {
-        match idx {
-            1 => { self.s1 = true; }
-            2 => { self.s2 = true; }
-            3 => { self.s3 = true; }
-            _ => {}
-        }
-    }
-
-    fn off(&mut self, idx: u8) {
-        match idx {
-            1 => { self.s1 = false; }
-            2 => { self.s2 = false; }
-            3 => { self.s3 = false; }
-            _ => {}
-        }
-    } 
-    */
     fn json_status(&self) -> heapless::String<128> {
         // use heapless string since no_std
         let mut s = heapless::String::<128>::new();
@@ -133,25 +116,6 @@ impl Relays {
     fn new(r1: Output<'static>, r2: Output<'static>, r3: Output<'static>) -> Self {
         Self { r1, r2, r3  }
     }
-/* 
-    fn on(&mut self, idx: u8) {
-        match idx {
-            1 => { self.r1.set_high(); }
-            2 => { self.r2.set_high(); }
-            3 => { self.r3.set_high(); }
-            _ => {}
-        }
-    }
-
-    fn off(&mut self, idx: u8) {
-        match idx {
-            1 => { self.r1.set_low(); }
-            2 => { self.r2.set_low(); }
-            3 => { self.r3.set_low(); }
-            _ => {}
-        }
-    }
- */
 }
 
 
@@ -176,6 +140,7 @@ async fn main(spawner: Spawner) {
     info!("Embassy initialized!");
 
     // display inclusion
+    /* 
     let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
          .with_sda(peripherals.GPIO8)
          .with_scl(peripherals.GPIO9);
@@ -184,15 +149,20 @@ async fn main(spawner: Spawner) {
     let mut display: Ssd1306<I2CInterface<I2c<'_, esp_hal::Blocking>>, DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>> = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     display.init().unwrap();
-    set_text_display(&mut display, "Welcome! instructions are loading..");
-
+    info!("Display initialized");
+    set_text_display(&mut display, "Welcome!, instructions are loading..");
+ */
+    info!("Initializing RNG");
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
+    info!("Done");
     let timer1 = TimerGroup::new(peripherals.TIMG0);
+    info!("Timer initialized");
     
     let wifi_init = &*mk_static!(
         EspWifiController<'static>,
         init(timer1.timer0, rng.clone()).unwrap()
     );
+    info!("Wifi initialized");
     
     let (mut controller, interfaces) = esp_wifi::wifi::new(&wifi_init, peripherals.WIFI)
         .expect("Failed to initialize WIFI controller");
@@ -200,24 +170,18 @@ async fn main(spawner: Spawner) {
     let wifi_ap_device = interfaces.ap;
     let wifi_sta_device = interfaces.sta;
 
-    let gw_ip_addr_str = "192.168.2.1";
-    let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).unwrap();
-    let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(gw_ip_addr, 24),
-        gateway: Some(gw_ip_addr),
-        dns_servers: Default::default(),
-    });
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // cannot use nvs without the safe api
+    info!("Flash initialized");
     let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new());
  
     let mut start_wifi = false;
     let client_config = if let Some((ssid, bssid)) = get_wifi_config(&mut flash).await {
         let ssidn =  bytes_to_clean_string(ssid.as_bytes()).unwrap_or(String::new());
         let bssidn =  bytes_to_clean_string(bssid.as_bytes()).unwrap_or(String::new());
+        info!("Wifi configured");
         
-        set_text_display(&mut display, "Wifi is configured");
+        //set_text_display(&mut display, "Wifi is configured");
         start_wifi = true;
         Configuration::Client(
             ClientConfiguration {
@@ -227,7 +191,7 @@ async fn main(spawner: Spawner) {
             })
     } else {
         info!("Wifi not configured yet, starting only AP");
-        set_text_display(&mut display, "Wifi is not configured");
+        //set_text_display(&mut display, "Wifi is not configured");
         Configuration::AccessPoint(
             AccessPointConfiguration {
                 ssid: "esp-wifi".into(),
@@ -247,14 +211,12 @@ async fn main(spawner: Spawner) {
     
     spawner.spawn(handle_relays(relays)).unwrap();
 
-    // TODO: create struct for buttons
-    // TODO: add more buttons
     let b1= Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     let b2 = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     let b3 = Input::new(peripherals.GPIO4, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     spawner.spawn(manual_buttons(b1, b2, b3)).unwrap(); 
 
-
+    // buffers
     let rx_buf = RX_BUFFER.init([0; 1536]);
     let tx_buf = TX_BUFFER.init([0; 1536]);
     let mut buffer = [0u8; 1024];
@@ -264,6 +226,13 @@ async fn main(spawner: Spawner) {
         
     // refactored this both cases into tasks (didnt work well)
     if !start_wifi {
+        let gw_ip_addr_str = "192.168.2.1";
+        let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).unwrap();
+        let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(gw_ip_addr, 24),
+            gateway: Some(gw_ip_addr),
+            dns_servers: Default::default(),
+        });
         info!("Spawning ap");
         let (ap_stack, ap_runner) = embassy_net::new(
             wifi_ap_device,
@@ -271,7 +240,7 @@ async fn main(spawner: Spawner) {
             mk_static!(StackResources<3>, StackResources::<3>::new()),
             seed,
         ); 
-        set_text_display(&mut display, "Connect to 'esp-wifi', open 192.168.2.1:8080, to configure your LAN");
+        //set_text_display(&mut display, "Connect to 'esp-wifi', open 192.168.2.1:8080, to configure your LAN");
         spawner.spawn(ap_connection(controller)).ok();
         spawner.spawn(run_dhcp(ap_stack, gw_ip_addr_str)).ok();
         spawner.spawn(net_task(ap_runner)).ok();
@@ -351,8 +320,9 @@ async fn main(spawner: Spawner) {
     } else {
         // BUG if enters this branch, AP wont work anymore (stuck in "Obtainig IP")
         // and printing: WARN - Unable to allocate 1700 bytes
-        set_text_display(&mut display, "Connecting to Wifi");
-        let sta_config = embassy_net::Config::dhcpv4(Default::default());
+        //set_text_display(&mut display, "Connecting to Wifi");
+        info!("Starting STA mode");
+        let sta_config = embassy_net::Config::dhcpv4(DhcpConfig::default());
         let (sta_stack, sta_runner) = embassy_net::new(
             wifi_sta_device,
             sta_config,
@@ -388,7 +358,7 @@ async fn main(spawner: Spawner) {
         };
         info!("Connected to {}", sta_address);
         let ip_text = format!("Go to , {}:8080", sta_address);
-        set_text_display(&mut display, &ip_text);
+        //set_text_display(&mut display, &ip_text);
 
         let sta_stack_static = mk_static!(Stack, sta_stack.clone());
         spawner.spawn(mqtt_task(&*sta_stack_static)).unwrap();
@@ -432,9 +402,7 @@ async fn main(spawner: Spawner) {
                 let _ = socket.write_all(resp.as_bytes()).await;
                 let _ = socket.flush().await;
                 sent = true;
-            
             } else {
-                // TODO: what to do with flags? 
                 match first_line {
                     l if l.starts_with("GET /relay1")  => { CHANNEL.send(1).await;  sent = send_ok(&mut socket).await; }
                     l if l.starts_with("GET /relay2")  => { CHANNEL.send(2).await;  sent = send_ok(&mut socket).await; }
@@ -442,7 +410,6 @@ async fn main(spawner: Spawner) {
                     _ => {}
                 }
             }
-
             if !sent {
                 // 404 for anything else
                 let body = "Not Found";
@@ -454,14 +421,14 @@ async fn main(spawner: Spawner) {
                 let _ = socket.write_all(resp.as_bytes()).await;
                 let _ = socket.flush().await;
             }
-                        
-            log::info!("Response sent, closing socket");
+            //log::info!("Response sent, closing socket");
+            //socket.close();                       
+            //socket.abort();
         }
     }
 }
 
-// TODO: handle mqtt messaging better
-// maybe the json_status for each button in the loop directly?
+// TOFIX: MQTT channel messaging BREAKS the app
 #[embassy_executor::task]
 async fn handle_relays(relays: &'static mut Relays) {
     let mut handle = async |idx: u8| {
@@ -470,20 +437,20 @@ async fn handle_relays(relays: &'static mut Relays) {
             1 => {
                 relays.r1.toggle();
                 state.s1 = !state.s1;
-                let m = if state.s1 == true { "relay1: ON" } else { "relay1: OFF" };
-                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
+                //let m = if state.s1 == true { "relay1: ON" } else { "relay1: OFF" };
+                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             2 => {
                 relays.r2.toggle();
                 state.s2 = !state.s2;
-                let m = if state.s2 == true { "relay2: ON" } else { "relay2: OFF" };
-                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
+                //let m = if state.s2 == true { "relay2: ON" } else { "relay2: OFF" };
+                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             3 => {
                 relays.r3.toggle();
                 state.s3 = !state.s3;
-                let m = if state.s3 == true { "relay3: ON" } else { "relay3: OFF" };
-                MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
+                //let m = if state.s3 == true { "relay3: ON" } else { "relay3: OFF" };
+                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             _ => {}
         }
@@ -491,6 +458,9 @@ async fn handle_relays(relays: &'static mut Relays) {
     loop {
         let num = CHANNEL.receive().await;
         handle(num).await;
+        // here it breaks it too
+        let state = STATE.lock().await;
+        MQTT_CHANNEL.send((TOPIC.to_string(), state.json_status().to_string())).await;
     }
 
 }
@@ -500,6 +470,7 @@ async fn handle_relays(relays: &'static mut Relays) {
 // create the first message (discovery retain=true) for a broker indexing
 // create a config web page for the mqtt client & settings
 // topics: set & state for each relay -> name/r1|2|3/set|state (set name on config?)
+
 #[embassy_executor::task]
 async fn mqtt_task(stack: &'static Stack<'static>) {
     info!("Start mqtt task");
@@ -539,7 +510,7 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
         let mut topic_set = String::new();
         topic_set.push_str(TOPIC);
         topic_set.push_str("/set");
-        //mqtt_client.subscribe_to_topic(&topic_set).await.unwrap();
+        mqtt_client.subscribe_to_topic(&topic_set).await.unwrap();
 
         // start client loop
         info!("Starting mqtt messages");
@@ -552,7 +523,7 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
                     mqtt_client.send_message(
                         &topic, 
                         payload.as_bytes(), 
-                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1, 
+                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS0, 
                     false
                     ).await.unwrap();
                 },
@@ -709,8 +680,7 @@ async fn sta_connection(mut controller: WifiController<'static>) {
         if !matches!(controller.is_started(), Ok(true)) {
             log::info!("Starting wifi");
             controller.start_async().await.unwrap();
-            log::info!("Wifi started!");
-
+            /* 
             log::info!("Scan");
             let scan_config = esp_wifi::wifi::ScanConfig::default();
             let result = controller
@@ -719,7 +689,8 @@ async fn sta_connection(mut controller: WifiController<'static>) {
                 .unwrap();
             for ap in result {
                 log::info!("{:?}", ap);
-            }
+            } 
+            */
         }
         log::info!("About to connect...");
 
