@@ -39,7 +39,7 @@ use esp_wifi::wifi::{AccessPointConfiguration, Configuration, WifiDevice, Client
 use esp_wifi::{init, EspWifiController};
 use embedded_io_async::Write;
 use static_cell::StaticCell;
-
+/* 
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
@@ -47,9 +47,9 @@ use embedded_graphics::{
     prelude::*,
     text::Text,
 };
-
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
+ */
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -74,10 +74,7 @@ macro_rules! mk_static {
 }
 
 static CHANNEL: Channel<CriticalSectionRawMutex, u8, 8> = Channel::new();
-
-// TODO: this should be configurable and on NVS
-static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (String, String), 5> = Channel::new(); // TODO: Message type (topic, message) ??
-const TOPIC: &str = "ap-sta-relay-server";
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, String, 5> = Channel::new(); // TODO: Message type (topic, message) ??
 
 static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
 
@@ -140,7 +137,7 @@ async fn main(spawner: Spawner) {
     info!("Embassy initialized!");
 
     // display inclusion
-    /* 
+/* 
     let i2c = I2c::new(peripherals.I2C0, Config::default()).unwrap()
          .with_sda(peripherals.GPIO8)
          .with_scl(peripherals.GPIO9);
@@ -151,7 +148,7 @@ async fn main(spawner: Spawner) {
     display.init().unwrap();
     info!("Display initialized");
     set_text_display(&mut display, "Welcome!, instructions are loading..");
- */
+*/
     info!("Initializing RNG");
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
     info!("Done");
@@ -200,6 +197,23 @@ async fn main(spawner: Spawner) {
         )
     };
     controller.set_configuration(&client_config).unwrap();
+    let mqtt_configuration = if let Some(mqtt_config) = get_mqtt_config(&mut flash).await {
+        let broker =  bytes_to_clean_string(mqtt_config.0.as_bytes()).unwrap_or(String::new()).trim_matches('\"').to_string();
+        let port =  bytes_to_clean_string(mqtt_config.1.as_bytes()).unwrap_or(String::new());
+        let username =  bytes_to_clean_string(mqtt_config.2.as_bytes()).unwrap_or(String::new()).trim_matches('\"').to_string();
+        let password =  bytes_to_clean_string(mqtt_config.3.as_bytes()).unwrap_or(String::new()).trim_matches('\"').to_string();
+        let topic =  bytes_to_clean_string(mqtt_config.4.as_bytes()).unwrap_or(String::new()).trim_matches('\"').to_string();
+        Some(MqttConfig {
+            broker: broker,
+            port: port,
+            username: username,
+            password: password,
+            topic: topic
+        })
+    } else {
+        None
+    };
+    info!("Mqtt configuration: {:?}", mqtt_configuration);
 
     // app logic
     let r1 = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
@@ -208,8 +222,8 @@ async fn main(spawner: Spawner) {
     let relays: &'static mut Relays = RELAYS_CELL.init(
         Relays::new(r1, r2, r3)
     );
-    
-    spawner.spawn(handle_relays(relays)).unwrap();
+
+    spawner.spawn(handle_relays(relays, mqtt_configuration.is_some())).unwrap();
 
     let b1= Input::new(peripherals.GPIO2, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
     let b2 = Input::new(peripherals.GPIO3, InputConfig::default().with_pull(esp_hal::gpio::Pull::Up));
@@ -223,6 +237,7 @@ async fn main(spawner: Spawner) {
     
     // html to serve
     let page = if start_wifi { include_str!("../html/index.html") } else { include_str!("../html/ap_credentials.html") };
+    let mqtt_config_page = include_str!("../html/mqtt_config.html");
         
     // refactored this both cases into tasks (didnt work well)
     if !start_wifi {
@@ -277,7 +292,7 @@ async fn main(spawner: Spawner) {
                             if let Some(body) = extract_body(to_print) {
                                 if let Some((ssid, bssid)) = parse_form(body) {
                                     info!("Storing ssid:{} & bssid: {}", ssid, bssid);
-                                    store_credentials(&mut flash, ssid, bssid).await;
+                                    store_wifi_credentials(&mut flash, ssid, bssid).await;
                                     info!("restart..");
                                     esp_hal::system::software_reset();                           
                                 }
@@ -357,11 +372,13 @@ async fn main(spawner: Spawner) {
             }
         };
         info!("Connected to {}", sta_address);
-        let ip_text = format!("Go to , {}:8080", sta_address);
+        //let ip_text = format!("Go to , {}:8080", sta_address);
         //set_text_display(&mut display, &ip_text);
 
         let sta_stack_static = mk_static!(Stack, sta_stack.clone());
-        spawner.spawn(mqtt_task(&*sta_stack_static)).unwrap();
+        if let Some(mqtt_conf) = mqtt_configuration {
+            spawner.spawn(mqtt_task(&*sta_stack_static, mqtt_conf)).unwrap();
+        }
 
         let mut socket = TcpSocket::new(sta_stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
@@ -402,6 +419,39 @@ async fn main(spawner: Spawner) {
                 let _ = socket.write_all(resp.as_bytes()).await;
                 let _ = socket.flush().await;
                 sent = true;
+            } else if first_line.starts_with("GET /mqtt_config") {
+                // get mqtt config
+                info!("TODO: return internal mqtt config");
+            } else if first_line.starts_with("POST /mqtt_config HTTP/1.1") {
+                // store mqtt config
+                //let mqtt_configuration = unsafe { core::str::from_utf8_unchecked(&buffer[..(n)]) };
+                //TODO: adapt this to the mqtt config form    
+                
+                if let Some(body) = extract_body(req) {
+                    info!("body: {:?}", body);
+                    if let Some((broker, port, username, password, topic)) = parse_mqtt_form(body) {
+                        info!("broker {}", broker);
+                        info!("port {}", port);
+                        info!("username {}", username);
+                        info!("password {}", password);
+                        info!("topic {}", topic);
+                        store_mqtt_config(&mut flash, broker, port, username, password, topic).await;
+                        send_ok(&mut socket).await;
+                        Timer::after(Duration::from_secs(3)).await;
+                        info!("restart..");
+                        esp_hal::system::software_reset();                           
+                    }
+                }
+            } else if first_line.starts_with("GET /config_mqtt") {
+                // return mqtt config page
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                    mqtt_config_page.len(),
+                    mqtt_config_page
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.flush().await;
+                sent = true;
             } else {
                 match first_line {
                     l if l.starts_with("GET /relay1")  => { CHANNEL.send(1).await;  sent = send_ok(&mut socket).await; }
@@ -428,29 +478,22 @@ async fn main(spawner: Spawner) {
     }
 }
 
-// TOFIX: MQTT channel messaging BREAKS the app
 #[embassy_executor::task]
-async fn handle_relays(relays: &'static mut Relays) {
+async fn handle_relays(relays: &'static mut Relays, mqtt_active: bool) {
     let mut handle = async |idx: u8| {
         let mut state = STATE.lock().await;
         match idx {
             1 => {
                 relays.r1.toggle();
                 state.s1 = !state.s1;
-                //let m = if state.s1 == true { "relay1: ON" } else { "relay1: OFF" };
-                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             2 => {
                 relays.r2.toggle();
                 state.s2 = !state.s2;
-                //let m = if state.s2 == true { "relay2: ON" } else { "relay2: OFF" };
-                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             3 => {
                 relays.r3.toggle();
                 state.s3 = !state.s3;
-                //let m = if state.s3 == true { "relay3: ON" } else { "relay3: OFF" };
-                //MQTT_CHANNEL.send((TOPIC.to_string(), m.to_string())).await;
             },
             _ => {}
         }
@@ -459,8 +502,10 @@ async fn handle_relays(relays: &'static mut Relays) {
         let num = CHANNEL.receive().await;
         handle(num).await;
         // here it breaks it too
-        let state = STATE.lock().await;
-        MQTT_CHANNEL.send((TOPIC.to_string(), state.json_status().to_string())).await;
+        if mqtt_active {
+            let state = STATE.lock().await;
+            MQTT_CHANNEL.send( state.json_status().to_string()).await;
+        }
     }
 
 }
@@ -472,7 +517,7 @@ async fn handle_relays(relays: &'static mut Relays) {
 // topics: set & state for each relay -> name/r1|2|3/set|state (set name on config?)
 
 #[embassy_executor::task]
-async fn mqtt_task(stack: &'static Stack<'static>) {
+async fn mqtt_task(stack: &'static Stack<'static>, config: MqttConfig) {
     info!("Start mqtt task");
     const MQTT_BUFFER_SIZE: usize = 1024;
     let mut mqtt_buf = [0; MQTT_BUFFER_SIZE];
@@ -486,8 +531,12 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
             rust_mqtt::client::client_config::MqttVersion::MQTTv5, 
             CountingRng(124356)         // TODO: use a real random
         ); 
-        let addr = core::net::SocketAddr::new(Ipv4Addr::new(192, 168, 18, 9).into(), 1883);
-        
+        //let addr = core::net::SocketAddr::new(Ipv4Addr::new(192, 168, 18, 9).into(), 1883);
+        let mut socket_str = String::new();
+        socket_str.push_str(&config.broker);
+        socket_str.push_str(":");
+        socket_str.push_str(&config.port);
+        let addr = core::net::SocketAddr::from_str(&socket_str).expect("Error on address definition");
         let mut tcp_state: TcpClientState<3, MQTT_BUFFER_SIZE, MQTT_BUFFER_SIZE> = TcpClientState::new();
         let tcp_client = TcpClient::new(*stack, &mut tcp_state);
         let tcp_connection = tcp_client.connect(addr).await.unwrap();
@@ -508,7 +557,7 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
         // subscribe to command topics
         info!("Subscribing");
         let mut topic_set = String::new();
-        topic_set.push_str(TOPIC);
+        topic_set.push_str(&config.topic);
         topic_set.push_str("/set");
         mqtt_client.subscribe_to_topic(&topic_set).await.unwrap();
 
@@ -519,9 +568,9 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
                 MQTT_CHANNEL.receive(),
                 mqtt_client.receive_message()
             ).await {
-                Either::First((topic, payload)) => {
+                Either::First( payload) => {
                     mqtt_client.send_message(
-                        &topic, 
+                        &config.topic, 
                         payload.as_bytes(), 
                     rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS0, 
                     false
@@ -529,28 +578,15 @@ async fn mqtt_task(stack: &'static Stack<'static>) {
                 },
                 Either::Second(res) => {
                     info!("Received: {:?}", res);
-                    // TOFIX: this code below seems to break everything (actually from wifi connection)
-                    
                     match res {
-                        Ok((topic, payload)) => {
-                            // filter topic for SET commands
-                            // ignore others
-                            //if let Some((prefix, command)) = topic.rsplit_once("/") {
-                            //    match command {
-                            //        "set" => {
-                            // get relay to toggle on the payload
-                            // and send command through CHANNEL
-                                let relay_idx = u8::from_str_radix(
-                                    from_utf8(payload).unwrap(), 
-                                    10).unwrap_or(0);   // TODO: default case is noop 
-                                CHANNEL.send(relay_idx).await;
-                                //    };
-                            //        "state" => {info!("TODO: get states")},
-                            //        _ => break
-                            //    }
-                            //}
+                        Ok((_topic, payload)) => {
+                            let relay_idx = u8::from_str_radix(
+                                from_utf8(payload).unwrap(), 
+                                10).unwrap_or(0);   // default case is noop 
+                            CHANNEL.send(relay_idx).await;
                         },
-                        Err(_) => break,
+                        // This receives lots of messages.. why???
+                        Err(_) => continue,//break,
                     }
                     
                 }
@@ -594,7 +630,7 @@ async fn manual_buttons(b1: Input<'static>, b2: Input<'static>, b3: Input<'stati
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
-
+/* 
 fn set_text_display(
     display: &mut Ssd1306<I2CInterface<I2c<'_, esp_hal::Blocking>>, DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>>,
     text: &str) {
@@ -613,7 +649,7 @@ fn set_text_display(
     }
     display.flush().unwrap();
 }
-
+ */
 async fn get_wifi_config(mut flash: &mut impl NorFlash) -> Option<(String, String)> {
     let mut ssid_buffer = [0; 32];
     let mut bssid_buffer = [0; 32];
@@ -643,8 +679,77 @@ async fn get_wifi_config(mut flash: &mut impl NorFlash) -> Option<(String, Strin
         None
     }
 }
+async fn get_mqtt_config(mut flash: &mut impl NorFlash) -> Option<(String, String, String, String, String)> {
+    let mut broker_buffer = [0; 32];
+    let mut port_buffer = [0; 32];
+    let mut username_buffer = [0; 32];
+    let mut password_buffer = [0; 32];
+    let mut topic_buffer = [0; 32];
 
-async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: String) {
+    let broker = if let Some(broker_data) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
+        &mut flash, 
+        NVS_FLASH_RANGE.clone(), 
+        &mut NoCache::new(), 
+        &mut broker_buffer, 
+        &2
+    ).await.unwrap() {
+        core::str::from_utf8(&broker_data).unwrap_or("").to_string()
+    } else {
+        "".to_string()
+    };
+    let port = if let Some(port_data) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
+        &mut flash, 
+        NVS_FLASH_RANGE.clone(), 
+        &mut NoCache::new(), 
+        &mut port_buffer, 
+        &3
+    ).await.unwrap() {
+        core::str::from_utf8(port_data).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let username = if let Some(username_data) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
+        &mut flash, 
+        NVS_FLASH_RANGE.clone(), 
+        &mut NoCache::new(), 
+        &mut username_buffer, 
+        &4
+    ).await.unwrap() {
+        core::str::from_utf8(username_data).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let password = if let Some(password_data) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
+        &mut flash, 
+        NVS_FLASH_RANGE.clone(), 
+        &mut NoCache::new(), 
+        &mut password_buffer, 
+        &5
+    ).await.unwrap() {
+        core::str::from_utf8(password_data).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let topic = if let Some(topic_data) = sequential_storage::map::fetch_item::<u8, &[u8], _>(
+        &mut flash, 
+        NVS_FLASH_RANGE.clone(), 
+        &mut NoCache::new(), 
+        &mut topic_buffer, 
+        &6
+    ).await.unwrap() {
+        core::str::from_utf8(topic_data).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+
+    if &broker != "" && &port != "" && &topic != "" {
+        return Some((broker, port, username, password, topic))
+    } else {
+        return None
+    }
+}
+
+async fn store_wifi_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: String) {
     const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
     let mut ssid_buffer = [0; 32];
     let mut bssid_buffer = [0; 32];
@@ -664,6 +769,55 @@ async fn store_credentials(mut flash: &mut impl NorFlash, ssid: String, bssid: S
         &mut bssid_buffer,
         &1,
         &bssid.as_bytes(),
+    ).await.unwrap();   
+}
+async fn store_mqtt_config(mut flash: &mut impl NorFlash, broker: String, port: String, username: String, password: String, topic: String) {
+    const NVS_FLASH_RANGE: core::ops::Range<u32> = 0x9000..0xF000;
+    let mut broker_buffer = [0; 32];
+    let mut port_buffer = [0; 32];
+    let mut username_buffer = [0; 32];
+    let mut password_buffer = [0; 32];
+    let mut topic_buffer = [0; 32];
+
+     sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut broker_buffer,
+        &2,
+        &broker.as_bytes(),
+    ).await.unwrap();
+    sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut port_buffer,
+        &3,
+        &port.as_bytes(),
+    ).await.unwrap();   
+    sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut username_buffer,
+        &4,
+        &username.as_bytes(),
+    ).await.unwrap();   
+    sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut password_buffer,
+        &5,
+        &password.as_bytes(),
+    ).await.unwrap();   
+    sequential_storage::map::store_item(
+        &mut flash,
+        NVS_FLASH_RANGE.clone(),
+        &mut NoCache::new(),
+        &mut topic_buffer,
+        &6,
+        &topic.as_bytes(),
     ).await.unwrap();   
 }
 
@@ -786,6 +940,43 @@ fn parse_form(body: &str) -> Option<(String, String)> {
         index += 1;
     }
     Some((ssid.to_string(), bssid.to_string()))
+}
+
+#[derive(Debug)]
+struct MqttConfig {
+    broker: String,
+    port: String,//i64,
+    username: String, // could be Option
+    password: String, // could be Option
+    topic: String,
+}
+
+fn parse_mqtt_form(body: &str) -> Option<(String, String, String, String, String)> {
+    let mut broker = "";
+    let mut port= "";
+    let mut username = "";
+    let mut password = "";
+    let mut topic = "";
+    let mut index = 0;
+    for pair in body.split(',') {
+        let mut iter = pair.splitn(2, ':');
+        let _key = iter.next().unwrap_or("");
+        let val = iter.next().unwrap_or("");
+        if index == 0 {
+            broker = val;
+        } else if index == 1 {
+            port = val;
+        } else if index == 2 {
+            username = val;
+        } else if index == 3 {
+            password = val;
+        } else if index == 4 {
+            // needs to remove last bracket "}"
+            topic = val.trim_end_matches("}");
+        }
+        index += 1;
+    }
+    Some((broker.to_string(), port.to_string(), username.to_string(), password.to_string(), topic.to_string()))
 }
 
 fn bytes_to_clean_string(data: &[u8]) -> Option<String> {

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MQTT Configuration</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { 
+      --bg:#0f172a; 
+      --card:#111827; 
+      --text:#e5e7eb; 
+      --muted:#9ca3af; 
+      --accent:#60a5fa; 
+      --danger:#f87171; 
+      --ok:#34d399;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; background:linear-gradient(180deg,#0b1220,#0f172a 30%);
+      min-height:100vh; display:flex; align-items:center; justify-content:center; color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    .card{
+      width:min(420px,92vw); background:var(--card); border-radius:18px; padding:22px;
+      box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
+      border:1px solid rgba(255,255,255,.06);
+    }
+    h1{margin:0 0 10px;font-size:20px;letter-spacing:.2px;text-align:center}
+    p{margin:.25rem 0 1.25rem;color:var(--muted);font-size:14px;text-align:center}
+    label{display:block;font-size:13px;margin-bottom:4px;color:var(--muted);}
+    input{
+      width:100%;padding:9px 11px;border-radius:10px;border:1px solid rgba(255,255,255,.1);
+      background:rgba(255,255,255,.04);color:var(--text);font-size:14px;outline:none;
+      transition:border .2s, background .2s;
+    }
+    input:focus{border-color:var(--accent);background:rgba(255,255,255,.07);}
+    .field{margin-bottom:14px;}
+    button{
+      width:100%;padding:10px;border:none;border-radius:12px;font-weight:600;
+      color:white;cursor:pointer;font-size:15px;
+      background:var(--accent);box-shadow:0 4px 18px rgba(96,165,250,.25);
+      transition:transform .05s ease, background .2s ease;
+    }
+    button:active{transform:scale(.97)}
+    .msg{
+      text-align:center;margin-top:12px;font-size:13px;color:var(--muted);
+      min-height:18px;
+    }
+    .ok{color:var(--ok);}
+    .err{color:var(--danger);}
+  </style>
+
+  <script>
+    async function loadConfig() {
+      try {
+        const res = await fetch("/mqtt_config", { cache: "no-store" });
+        if (!res.ok) throw new Error("Failed to load config");
+        const cfg = await res.json();
+        for (const k in cfg) {
+          const el = document.getElementById(k);
+          if (el) el.value = cfg[k];
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function saveConfig() {
+      const data = {
+        broker: document.getElementById("broker").value.trim(),
+        port: parseInt(document.getElementById("port").value.trim()) || 1883,
+        username: document.getElementById("username").value.trim(),
+        password: document.getElementById("password").value.trim(),
+        topic_prefix: document.getElementById("topic_prefix").value.trim()
+      };
+      const msg = document.getElementById("msg");
+      msg.textContent = "Saving...";
+      msg.className = "msg";
+
+      try {
+        const res = await fetch("/mqtt_config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        msg.textContent = "✅ Configuration saved!";
+        msg.classList.add("ok");
+      } catch (e) {
+        msg.textContent = "❌ Failed to save: " + e.message;
+        msg.classList.add("err");
+      }
+    }
+
+    window.onload = loadConfig;
+  </script>
+</head>
+
+<body>
+  <div class="card">
+    <h1>MQTT Configuration</h1>
+    <p>Set connection parameters for your MQTT client.</p>
+    <div class="field">
+      <label for="broker">Broker Address</label>
+      <input id="broker" placeholder="192.168.0.10">
+    </div>
+    <div class="field">
+      <label for="port">Port</label>
+      <input id="port" placeholder="1883">
+    </div>
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" placeholder="optional">
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="optional">
+    </div>
+    <div class="field">
+      <label for="topic_prefix">Topic Prefix</label>
+      <input id="topic_prefix" placeholder="home/relay/">
+    </div>
+    <button onclick="saveConfig()">Save Configuration</button>
+    <div id="msg" class="msg"></div>
+    <a class="footer" href="/">Home</a>
+  </div>
+</body>
+</html>
