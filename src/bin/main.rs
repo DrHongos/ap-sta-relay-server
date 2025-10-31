@@ -74,7 +74,7 @@ macro_rules! mk_static {
 }
 
 static CHANNEL: Channel<CriticalSectionRawMutex, u8, 8> = Channel::new();
-static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, String, 5> = Channel::new(); // TODO: Message type (topic, message) ??
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, String, 5> = Channel::new();
 
 static RELAYS_CELL: StaticCell<Relays> = StaticCell::new();
 
@@ -288,7 +288,7 @@ async fn main(spawner: Spawner) {
                         let to_print = unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
                         let first_line = to_print.lines().next().unwrap_or("");
                         if first_line.starts_with("POST /save HTTP/1.1") {
-                            info!("Received {}", first_line);
+                            info!("Received in AP {}", first_line);
                             if let Some(body) = extract_body(to_print) {
                                 if let Some((ssid, bssid)) = parse_form(body) {
                                     info!("Storing ssid:{} & bssid: {}", ssid, bssid);
@@ -376,7 +376,7 @@ async fn main(spawner: Spawner) {
         //set_text_display(&mut display, &ip_text);
 
         let sta_stack_static = mk_static!(Stack, sta_stack.clone());
-        if let Some(mqtt_conf) = mqtt_configuration {
+        if let Some(mqtt_conf) = mqtt_configuration.clone() {
             spawner.spawn(mqtt_task(&*sta_stack_static, mqtt_conf)).unwrap();
         }
 
@@ -421,24 +421,30 @@ async fn main(spawner: Spawner) {
                 sent = true;
             } else if first_line.starts_with("GET /mqtt_config") {
                 // get mqtt config
-                info!("TODO: return internal mqtt config");
+                let body = if let Some(mqtt_c) = &mqtt_configuration {
+                    mqtt_c.json_status()
+                } else {
+                    heapless::String::new()
+                };
+                //info!("returning {:?}", &body);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.flush().await;
+                sent = true;
             } else if first_line.starts_with("POST /mqtt_config HTTP/1.1") {
                 // store mqtt config
-                //let mqtt_configuration = unsafe { core::str::from_utf8_unchecked(&buffer[..(n)]) };
-                //TODO: adapt this to the mqtt config form    
-                
                 if let Some(body) = extract_body(req) {
                     info!("body: {:?}", body);
                     if let Some((broker, port, username, password, topic)) = parse_mqtt_form(body) {
-                        info!("broker {}", broker);
-                        info!("port {}", port);
-                        info!("username {}", username);
-                        info!("password {}", password);
-                        info!("topic {}", topic);
                         store_mqtt_config(&mut flash, broker, port, username, password, topic).await;
                         send_ok(&mut socket).await;
                         Timer::after(Duration::from_secs(3)).await;
-                        info!("restart..");
+                        //info!("restart..");
+                        socket.close();
                         esp_hal::system::software_reset();                           
                     }
                 }
@@ -511,11 +517,8 @@ async fn handle_relays(relays: &'static mut Relays, mqtt_active: bool) {
 }
 
 
-// make the mqtt client configurable (endpoint, topics, etc) on NVS
-// create the first message (discovery retain=true) for a broker indexing
-// create a config web page for the mqtt client & settings
-// topics: set & state for each relay -> name/r1|2|3/set|state (set name on config?)
-
+// TODO: create the first message (discovery retain=true) for a broker indexing
+// TOFIX: Network errors block the app 
 #[embassy_executor::task]
 async fn mqtt_task(stack: &'static Stack<'static>, config: MqttConfig) {
     info!("Start mqtt task");
@@ -577,7 +580,7 @@ async fn mqtt_task(stack: &'static Stack<'static>, config: MqttConfig) {
                     ).await.unwrap();
                 },
                 Either::Second(res) => {
-                    info!("Received: {:?}", res);
+                    info!("Received in mqtt listener: {:?}", res);
                     match res {
                         Ok((_topic, payload)) => {
                             let relay_idx = u8::from_str_radix(
@@ -942,13 +945,29 @@ fn parse_form(body: &str) -> Option<(String, String)> {
     Some((ssid.to_string(), bssid.to_string()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MqttConfig {
     broker: String,
     port: String,//i64,
     username: String, // could be Option
     password: String, // could be Option
     topic: String,
+}
+impl MqttConfig {
+    fn json_status(&self) -> heapless::String<128> {
+        let mut s = heapless::String::<128>::new();
+        use core::fmt::Write;
+        let _ = write!(
+            s,
+            "{{\"broker\":\"{}\",\"port\":\"{}\",\"username\":\"{}\",\"password\":\"{}\",\"topic\":\"{}\"}}",
+            self.broker, 
+            self.port, 
+            self.username, 
+            self.password, 
+            self.topic
+        );
+        s
+    }
 }
 
 fn parse_mqtt_form(body: &str) -> Option<(String, String, String, String, String)> {

@@ -55,7 +55,9 @@
       try {
         const res = await fetch("/mqtt_config", { cache: "no-store" });
         if (!res.ok) throw new Error("Failed to load config");
+        console.log(res)
         const cfg = await res.json();
+        console.log(cfg)
         for (const k in cfg) {
           const el = document.getElementById(k);
           if (el) el.value = cfg[k];
@@ -71,7 +73,7 @@
         port: parseInt(document.getElementById("port").value.trim()) || 1883,
         username: document.getElementById("username").value.trim(),
         password: document.getElementById("password").value.trim(),
-        topic_prefix: document.getElementById("topic_prefix").value.trim()
+        topic: document.getElementById("topic").value.trim()
       };
       const msg = document.getElementById("msg");
       msg.textContent = "Saving...";
@@ -117,8 +119,8 @@
       <input id="password" type="password" placeholder="optional">
     </div>
     <div class="field">
-      <label for="topic_prefix">Topic Prefix</label>
-      <input id="topic_prefix" placeholder="home/relay/">
+      <label for="topic">Topic Prefix</label>
+      <input id="topic" placeholder="home/relay/">
     </div>
     <button onclick="saveConfig()">Save Configuration</button>
     <div id="msg" class="msg"></div>
